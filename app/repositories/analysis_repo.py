@@ -12,6 +12,27 @@ class AnalysisRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def _save_snapshot(
+        self,
+        *,
+        analysis_id: int,
+        snapshot_name: str,
+        snapshot: dict[str, object],
+    ) -> Analysis:
+        analysis = await self.get_by_id(analysis_id)
+        if analysis is None:
+            raise ValueError(f"Analysis {analysis_id} not found.")
+
+        raw_response = dict(analysis.raw_response or {})
+        snapshots = dict(raw_response.get("snapshots") or {})
+        snapshots[snapshot_name] = snapshot
+        raw_response["snapshots"] = snapshots
+
+        analysis.raw_response = raw_response
+        await self.session.commit()
+        await self.session.refresh(analysis)
+        return analysis
+
     async def get_by_id(self, analysis_id: int) -> Analysis | None:
         """Return one analysis by primary key."""
         stmt = sa.select(Analysis).where(Analysis.id == analysis_id)
@@ -62,13 +83,76 @@ class AnalysisRepository:
         snapshot: dict[str, object],
     ) -> Analysis:
         """Store the latest market matching snapshot inside raw_response JSONB."""
+        return await self._save_snapshot(
+            analysis_id=analysis_id,
+            snapshot_name="market_matching",
+            snapshot=snapshot,
+        )
+
+    async def save_signal_engine_snapshot(
+        self,
+        *,
+        analysis_id: int,
+        snapshot: dict[str, object],
+    ) -> Analysis:
+        """Store the latest signal engine snapshot inside raw_response JSONB."""
+        return await self._save_snapshot(
+            analysis_id=analysis_id,
+            snapshot_name="signal_engine",
+            snapshot=snapshot,
+        )
+
+    async def save_risk_engine_decision(
+        self,
+        *,
+        analysis_id: int,
+        decision: dict[str, object],
+    ) -> Analysis:
+        """Append or replace one risk decision inside raw_response JSONB."""
         analysis = await self.get_by_id(analysis_id)
         if analysis is None:
             raise ValueError(f"Analysis {analysis_id} not found.")
 
         raw_response = dict(analysis.raw_response or {})
         snapshots = dict(raw_response.get("snapshots") or {})
-        snapshots["market_matching"] = snapshot
+        risk_snapshot = dict(snapshots.get("risk_engine") or {})
+        decisions = list(risk_snapshot.get("decisions") or [])
+
+        filtered_decisions = [
+            item for item in decisions if item.get("signal_id") != decision.get("signal_id")
+        ]
+        filtered_decisions.append(decision)
+
+        risk_snapshot["updated_at"] = decision.get("evaluated_at")
+        risk_snapshot["decisions"] = filtered_decisions
+        snapshots["risk_engine"] = risk_snapshot
+        raw_response["snapshots"] = snapshots
+
+        analysis.raw_response = raw_response
+        await self.session.commit()
+        await self.session.refresh(analysis)
+        return analysis
+
+    async def save_paper_trader_action(
+        self,
+        *,
+        analysis_id: int,
+        action: dict[str, object],
+    ) -> Analysis:
+        """Append one open/close action to the paper trader snapshot."""
+        analysis = await self.get_by_id(analysis_id)
+        if analysis is None:
+            raise ValueError(f"Analysis {analysis_id} not found.")
+
+        raw_response = dict(analysis.raw_response or {})
+        snapshots = dict(raw_response.get("snapshots") or {})
+        paper_snapshot = dict(snapshots.get("paper_trader") or {})
+        actions = list(paper_snapshot.get("actions") or [])
+        actions.append(action)
+
+        paper_snapshot["updated_at"] = action.get("action_at")
+        paper_snapshot["actions"] = actions
+        snapshots["paper_trader"] = paper_snapshot
         raw_response["snapshots"] = snapshots
 
         analysis.raw_response = raw_response

@@ -2,6 +2,45 @@
 
 Production-style MVP новостного торгового бота для Polymarket.
 
+## Быстрый запуск
+
+Демо-режим без API-ключей теперь поднимается одной командой:
+
+```bash
+docker compose up --build
+```
+
+Что произойдёт автоматически:
+- поднимется PostgreSQL
+- дождёмся готовности БД через healthcheck
+- автоматически применятся Alembic миграции через сервис `migrate`
+- поднимется FastAPI API
+- поднимется `scheduler`, который начнёт крутить pipeline
+
+Важно:
+- по умолчанию проект стартует в `stub/noop` режимах
+- это значит: demo-новости, demo-LLM, demo-markets и без реальных Telegram alerts
+- для реальных API позже достаточно задать нужные переменные в `.env`
+
+## Реальный Paper Mode
+
+Для paper trading с реальными новостями, реальным OpenAI и реальным Gamma API уже готов шаблон [paper_real.env](/Users/whomaun/polmarketbot/paper_real.env).
+
+Порядок такой:
+- открой `paper_real.env`
+- вставь `NEWS_API_KEY` и `OPENAI_API_KEY`
+- при желании включи Telegram alerts
+- запусти:
+
+```bash
+docker compose --env-file paper_real.env up --build
+```
+
+Важно:
+- `MARKET_FETCH_MODE=gamma` не требует отдельного API-ключа
+- это всё ещё `paper trading`, не live execution
+- если в БД уже есть старые test trades, risk engine может блокировать новые входы по лимитам и дубликатам
+
 На текущем этапе в README зафиксирована архитектура системы из ЭТАПА 1:
 - как проходит pipeline
 - за что отвечает каждый модуль
@@ -317,4 +356,5 @@ polymarket_bot/
 
 - ЭТАП 1 зафиксирован в этом README
 - ЭТАП 2 уже реализован: базовый FastAPI-каркас и `/health`
+- ЭТАП 13 зафиксирован в [docs/live_trading_checklist.md](docs/live_trading_checklist.md)
 - следующие этапы будут расширять текущую структуру без её ломки

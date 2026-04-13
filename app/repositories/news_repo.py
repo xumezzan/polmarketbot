@@ -3,6 +3,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.analysis import Analysis
 from app.models.news import NewsItem
 from app.schemas.news import NormalizedNewsItem
 
@@ -77,3 +78,18 @@ class NewsRepository:
         """Return the newest stored news item by id."""
         stmt = sa.select(NewsItem).order_by(NewsItem.id.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_without_analysis(self, *, limit: int) -> list[NewsItem]:
+        """Return news items that have not gone through LLM analysis yet."""
+        analysis_exists = (
+            sa.select(sa.literal(1))
+            .select_from(Analysis)
+            .where(Analysis.news_item_id == NewsItem.id)
+        )
+        stmt = (
+            sa.select(NewsItem)
+            .where(~sa.exists(analysis_exists))
+            .order_by(NewsItem.id.asc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
