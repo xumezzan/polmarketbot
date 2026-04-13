@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     risk_max_liquidity_share: float = 0.02
     risk_block_on_existing_position: bool = True
     paper_require_risk_approval: bool = True
+    paper_auto_close_enabled: bool = True
+    paper_take_profit_delta: float = 0.08
+    paper_stop_loss_delta: float = 0.05
+    paper_max_hold_minutes: int = 360
     scheduler_interval_minutes: float = 15.0
     scheduler_news_batch_limit: int = 10
     scheduler_continue_on_item_error: bool = True

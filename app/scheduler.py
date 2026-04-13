@@ -13,7 +13,7 @@ from app.services.alerting import AlertingService, build_alert_client
 from app.services.llm_analyzer import run_llm_analysis
 from app.services.market_client import run_market_matching
 from app.services.news_fetcher import run_news_ingestion
-from app.services.paper_trader import open_paper_position
+from app.services.paper_trader import open_paper_position, run_paper_trade_maintenance
 from app.services.risk_engine import run_risk_engine
 from app.services.signal_engine import run_signal_engine
 
@@ -41,6 +41,7 @@ class PipelineScheduler:
         cycle_id = started_at.strftime("%Y%m%dT%H%M%S%fZ")
 
         async with AsyncSessionLocal() as session:
+            maintenance_result = await run_paper_trade_maintenance(session, self.settings)
             ingestion_result = await run_news_ingestion(session, self.settings)
             pending_news = await NewsRepository(session).list_without_analysis(
                 limit=self.settings.scheduler_news_batch_limit
@@ -50,6 +51,7 @@ class PipelineScheduler:
             actionable_signal_count = 0
             approved_signal_count = 0
             opened_position_count = 0
+            closed_position_count = maintenance_result.closed_positions
 
             for news_item in pending_news:
                 item_result = PipelineItemResult(news_item_id=news_item.id)
@@ -154,8 +156,11 @@ class PipelineScheduler:
             actionable_signal_count=actionable_signal_count,
             approved_signal_count=approved_signal_count,
             opened_position_count=opened_position_count,
+            auto_close_evaluated_count=maintenance_result.evaluated_positions,
+            closed_position_count=closed_position_count,
             error_count=sum(len(item.errors) for item in item_results),
             item_results=item_results,
+            closed_trade_ids=maintenance_result.closed_trade_ids,
         )
 
         log_event(
@@ -170,6 +175,9 @@ class PipelineScheduler:
             actionable_signal_count=result.actionable_signal_count,
             approved_signal_count=result.approved_signal_count,
             opened_position_count=result.opened_position_count,
+            auto_close_evaluated_count=result.auto_close_evaluated_count,
+            closed_position_count=result.closed_position_count,
+            closed_trade_ids=result.closed_trade_ids,
             error_count=result.error_count,
         )
         await self.alerting_service.send_cycle_summary(result)

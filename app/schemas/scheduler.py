@@ -30,5 +30,8 @@ class SchedulerCycleResult(BaseModel):
     actionable_signal_count: int
     approved_signal_count: int
     opened_position_count: int
+    auto_close_evaluated_count: int
+    closed_position_count: int
     error_count: int
     item_results: list[PipelineItemResult] = Field(default_factory=list)
+    closed_trade_ids: list[int] = Field(default_factory=list)

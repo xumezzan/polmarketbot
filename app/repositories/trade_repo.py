@@ -59,6 +59,15 @@ class TradeRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def list_open_positions(self) -> list[Position]:
+        """Return all open paper positions with linked signal/analysis/news context."""
+        stmt = (
+            self._position_with_context()
+            .where(Position.status == PositionStatus.OPEN)
+            .order_by(Position.id)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def get_open_trade_for_position(self, *, position_id: int) -> PaperTrade | None:
         """Return the latest open paper trade attached to a position."""
         stmt = (

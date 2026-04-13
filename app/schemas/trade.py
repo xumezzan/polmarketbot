@@ -36,6 +36,36 @@ class PaperTradeCloseResult(BaseModel):
     status: str
     opened_at: str
     closed_at: str
+    close_reason: str | None = None
+    holding_minutes: float | None = None
+    current_price_delta: float | None = None
+
+
+class PaperTradeAutoCloseDecision(BaseModel):
+    """One auto-close maintenance decision for an open paper position."""
+
+    position_id: int
+    trade_id: int | None = None
+    signal_id: int
+    analysis_id: int | None = None
+    news_item_id: int | None = None
+    market_id: str
+    action: str
+    close_reason: str | None = None
+    current_price: float | None = None
+    current_price_delta: float | None = None
+    holding_minutes: float | None = None
+    error: str | None = None
+
+
+class PaperTradeMaintenanceResult(BaseModel):
+    """Summary of one paper-trade maintenance cycle."""
+
+    evaluated_positions: int = 0
+    closed_positions: int = 0
+    skipped_positions: int = 0
+    closed_trade_ids: list[int] = Field(default_factory=list)
+    decisions: list[PaperTradeAutoCloseDecision] = Field(default_factory=list)
 
 
 class PaperTradeStats(BaseModel):
