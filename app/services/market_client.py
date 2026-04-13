@@ -1,0 +1,565 @@
+import argparse
+import asyncio
+import logging
+import math
+import re
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Protocol
+
+import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import Settings, get_settings
+from app.database import AsyncSessionLocal
+from app.logging_utils import configure_logging, log_event
+from app.models.analysis import Analysis
+from app.repositories.analysis_repo import AnalysisRepository
+from app.schemas.market import GammaMarket, MarketCandidate, MarketMatchResult
+
+
+logger = logging.getLogger(__name__)
+
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "be",
+    "before",
+    "for",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "this",
+    "to",
+    "will",
+}
+
+
+class MarketClientError(Exception):
+    """Raised when market fetching or matching fails."""
+
+
+class MarketClientProtocol(Protocol):
+    """Contract for a market data provider."""
+
+    async def fetch_markets(self) -> list[GammaMarket]:
+        """Return a list of normalized markets."""
+
+
+class StubPolymarketClient:
+    """Fake market provider for local end-to-end tests."""
+
+    async def fetch_markets(self) -> list[GammaMarket]:
+        stub_payloads = [
+            {
+                "id": "stub-btc-100k",
+                "question": "Will Bitcoin reach $100,000 by December 31, 2026?",
+                "slug": "bitcoin-100k-by-end-of-2026",
+                "conditionId": "cond-btc-100k",
+                "liquidity": "245000.5",
+                "volume": "925000.2",
+                "bestBid": 0.58,
+                "bestAsk": 0.60,
+                "lastTradePrice": 0.59,
+                "active": True,
+                "closed": False,
+                "archived": False,
+                "enableOrderBook": True,
+                "outcomes": "[\"Yes\", \"No\"]",
+                "outcomePrices": "[\"0.59\", \"0.41\"]",
+                "clobTokenIds": "[\"btc100k-yes\", \"btc100k-no\"]",
+                "events": [
+                    {
+                        "id": "event-btc-price",
+                        "slug": "bitcoin-price-targets",
+                        "title": "Bitcoin price targets",
+                    }
+                ],
+            },
+            {
+                "id": "stub-btc-90k-apr",
+                "question": "Will Bitcoin be above $90,000 on April 30, 2026?",
+                "slug": "bitcoin-above-90k-april-30-2026",
+                "conditionId": "cond-btc-90k",
+                "liquidity": "178000.0",
+                "volume": "410000.0",
+                "bestBid": 0.63,
+                "bestAsk": 0.65,
+                "lastTradePrice": 0.64,
+                "active": True,
+                "closed": False,
+                "archived": False,
+                "enableOrderBook": True,
+                "outcomes": "[\"Yes\", \"No\"]",
+                "outcomePrices": "[\"0.64\", \"0.36\"]",
+                "clobTokenIds": "[\"btc90k-yes\", \"btc90k-no\"]",
+                "events": [
+                    {
+                        "id": "event-btc-price",
+                        "slug": "bitcoin-price-targets",
+                        "title": "Bitcoin price targets",
+                    }
+                ],
+            },
+            {
+                "id": "stub-btc-ath",
+                "question": "Will Bitcoin hit a new all-time high this quarter?",
+                "slug": "bitcoin-new-all-time-high-this-quarter",
+                "conditionId": "cond-btc-ath",
+                "liquidity": "132000.0",
+                "volume": "310000.0",
+                "bestBid": 0.47,
+                "bestAsk": 0.49,
+                "lastTradePrice": 0.48,
+                "active": True,
+                "closed": False,
+                "archived": False,
+                "enableOrderBook": True,
+                "outcomes": "[\"Yes\", \"No\"]",
+                "outcomePrices": "[\"0.48\", \"0.52\"]",
+                "clobTokenIds": "[\"btcath-yes\", \"btcath-no\"]",
+                "events": [
+                    {
+                        "id": "event-btc-quarterly",
+                        "slug": "bitcoin-quarterly-outlook",
+                        "title": "Bitcoin quarterly outlook",
+                    }
+                ],
+            },
+            {
+                "id": "stub-eth-ratio",
+                "question": "Will Ethereum outperform Bitcoin this month?",
+                "slug": "ethereum-outperform-bitcoin-this-month",
+                "conditionId": "cond-eth-btc",
+                "liquidity": "121000.0",
+                "volume": "280000.0",
+                "bestBid": 0.42,
+                "bestAsk": 0.44,
+                "lastTradePrice": 0.43,
+                "active": True,
+                "closed": False,
+                "archived": False,
+                "enableOrderBook": True,
+                "outcomes": "[\"Yes\", \"No\"]",
+                "outcomePrices": "[\"0.43\", \"0.57\"]",
+                "clobTokenIds": "[\"ethbtc-yes\", \"ethbtc-no\"]",
+                "events": [
+                    {
+                        "id": "event-altcoins",
+                        "slug": "crypto-relative-performance",
+                        "title": "Crypto relative performance",
+                    }
+                ],
+            },
+            {
+                "id": "stub-fed-cut",
+                "question": "Will the Fed cut rates in June 2026?",
+                "slug": "fed-cut-rates-june-2026",
+                "conditionId": "cond-fed-cut",
+                "liquidity": "201000.0",
+                "volume": "550000.0",
+                "bestBid": 0.32,
+                "bestAsk": 0.34,
+                "lastTradePrice": 0.33,
+                "active": True,
+                "closed": False,
+                "archived": False,
+                "enableOrderBook": True,
+                "outcomes": "[\"Yes\", \"No\"]",
+                "outcomePrices": "[\"0.33\", \"0.67\"]",
+                "clobTokenIds": "[\"fedcut-yes\", \"fedcut-no\"]",
+                "events": [
+                    {
+                        "id": "event-fed",
+                        "slug": "fed-rates",
+                        "title": "Federal Reserve rates",
+                    }
+                ],
+            },
+        ]
+
+        return [self._normalize_market(payload) for payload in stub_payloads]
+
+    def _normalize_market(self, payload: dict[str, object]) -> GammaMarket:
+        market = GammaMarket.model_validate(payload)
+        market.raw_payload = payload
+        return market
+
+
+class GammaPolymarketClient:
+    """Adapter over the official Polymarket Gamma API `/markets` endpoint."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def fetch_markets(self) -> list[GammaMarket]:
+        markets: list[GammaMarket] = []
+        base_url = f"{self.settings.gamma_api_base_url.rstrip('/')}/markets"
+
+        async with httpx.AsyncClient(timeout=self.settings.gamma_request_timeout_seconds) as client:
+            for page_index in range(self.settings.gamma_markets_max_pages):
+                offset = page_index * self.settings.gamma_markets_page_size
+                params = {
+                    "limit": self.settings.gamma_markets_page_size,
+                    "offset": offset,
+                }
+
+                # These parameters are confirmed by Polymarket docs and live API.
+                if self.settings.gamma_fetch_active_only:
+                    params["active"] = "true"
+                params["closed"] = "true" if self.settings.gamma_fetch_closed else "false"
+
+                try:
+                    response = await client.get(base_url, params=params)
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    log_event(
+                        logger,
+                        "gamma_market_fetch_failed",
+                        provider="polymarket_gamma",
+                        error=str(exc),
+                        offset=offset,
+                    )
+                    raise MarketClientError(f"Gamma market fetch failed: {exc}") from exc
+
+                payload = response.json()
+                if not isinstance(payload, list):
+                    raise MarketClientError("Gamma /markets returned a non-list payload.")
+
+                if not payload:
+                    break
+
+                normalized = [self._normalize_market(item) for item in payload]
+                markets.extend(normalized)
+
+        log_event(
+            logger,
+            "gamma_market_fetch_completed",
+            provider="polymarket_gamma",
+            fetched_count=len(markets),
+            page_size=self.settings.gamma_markets_page_size,
+            max_pages=self.settings.gamma_markets_max_pages,
+        )
+        return markets
+
+    def _normalize_market(self, payload: dict[str, object]) -> GammaMarket:
+        market = GammaMarket.model_validate(payload)
+        market.raw_payload = payload
+        return market
+
+
+class MarketRankerProtocol(Protocol):
+    """Contract for ranking candidate markets."""
+
+    def rank(
+        self,
+        *,
+        analysis: Analysis,
+        markets: list[GammaMarket],
+    ) -> list[MarketCandidate]:
+        """Return ranked candidates sorted by best score first."""
+
+
+class KeywordMarketRanker:
+    """Simple explainable keyword ranker. Easy to swap later for vector search."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def rank(
+        self,
+        *,
+        analysis: Analysis,
+        markets: list[GammaMarket],
+    ) -> list[MarketCandidate]:
+        query_tokens = _tokenize(analysis.market_query)
+        query_phrase = analysis.market_query.strip().lower()
+
+        ranked: list[MarketCandidate] = []
+        for market in markets:
+            candidate = self._score_market(
+                analysis=analysis,
+                market=market,
+                query_tokens=query_tokens,
+                query_phrase=query_phrase,
+            )
+            if candidate is not None:
+                ranked.append(candidate)
+
+        ranked.sort(key=lambda item: item.match_score, reverse=True)
+        return ranked
+
+    def _score_market(
+        self,
+        *,
+        analysis: Analysis,
+        market: GammaMarket,
+        query_tokens: set[str],
+        query_phrase: str,
+    ) -> MarketCandidate | None:
+        question_tokens = _tokenize(market.question)
+        slug_tokens = _tokenize(market.slug or "")
+        event_tokens = _tokenize(f"{market.event_title or ''} {market.event_slug or ''}")
+
+        exact_match = 1.0 if query_phrase and query_phrase in market.question.lower() else 0.0
+        question_overlap = _token_overlap(query_tokens, question_tokens)
+        slug_overlap = _token_overlap(query_tokens, slug_tokens)
+        event_overlap = _token_overlap(query_tokens, event_tokens)
+        liquidity_bonus = _scaled_liquidity(market.liquidity)
+
+        score_breakdown = {
+            "exact_match": exact_match * self.settings.market_match_exact_weight,
+            "question_overlap": question_overlap * self.settings.market_match_question_weight,
+            "slug_overlap": slug_overlap * self.settings.market_match_slug_weight,
+            "event_overlap": event_overlap * self.settings.market_match_event_weight,
+            "liquidity_bonus": liquidity_bonus * self.settings.market_match_liquidity_weight,
+        }
+        total_score = round(sum(score_breakdown.values()), 6)
+
+        if total_score < self.settings.market_match_min_score:
+            return None
+
+        reasons: list[str] = []
+        if exact_match:
+            reasons.append("market question contains the full market_query phrase")
+        if question_overlap:
+            reasons.append(f"question token overlap={question_overlap:.2f}")
+        if slug_overlap:
+            reasons.append(f"slug token overlap={slug_overlap:.2f}")
+        if event_overlap:
+            reasons.append(f"event token overlap={event_overlap:.2f}")
+        if liquidity_bonus:
+            reasons.append(f"liquidity bonus={liquidity_bonus:.2f}")
+
+        return MarketCandidate(
+            analysis_id=analysis.id,
+            news_item_id=analysis.news_item_id,
+            market_id=market.id,
+            question=market.question,
+            slug=market.slug,
+            condition_id=market.condition_id,
+            event_id=market.event_id,
+            event_slug=market.event_slug,
+            event_title=market.event_title,
+            yes_price=market.yes_price,
+            no_price=market.no_price,
+            yes_token_id=market.yes_token_id,
+            no_token_id=market.no_token_id,
+            best_bid=market.best_bid,
+            best_ask=market.best_ask,
+            last_trade_price=market.last_trade_price,
+            liquidity=market.liquidity,
+            volume=market.volume,
+            match_score=total_score,
+            match_reasons=reasons,
+            score_breakdown=score_breakdown,
+            correlation_key=market.event_slug or market.slug or market.condition_id or market.id,
+            raw_market=market.raw_payload,
+        )
+
+
+class CorrelationFilter:
+    """Drop overly similar candidate markets to keep top-N diverse."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def apply(self, candidates: list[MarketCandidate]) -> list[MarketCandidate]:
+        if not self.settings.market_correlation_filter_enabled:
+            return candidates
+
+        accepted: list[MarketCandidate] = []
+        for candidate in candidates:
+            if self._is_correlated(candidate, accepted):
+                continue
+            accepted.append(candidate)
+        return accepted
+
+    def _is_correlated(
+        self,
+        candidate: MarketCandidate,
+        accepted: list[MarketCandidate],
+    ) -> bool:
+        candidate_tokens = _tokenize(candidate.question)
+
+        for existing in accepted:
+            if (
+                self.settings.market_correlation_block_same_event
+                and candidate.event_slug
+                and existing.event_slug
+                and candidate.event_slug == existing.event_slug
+            ):
+                return True
+
+            similarity = _jaccard_similarity(candidate_tokens, _tokenize(existing.question))
+            if similarity >= self.settings.market_correlation_jaccard_threshold:
+                return True
+
+        return False
+
+
+class MarketMatchingService:
+    """Fetch markets and return top-N candidates for one analysis."""
+
+    def __init__(
+        self,
+        *,
+        client: MarketClientProtocol,
+        ranker: MarketRankerProtocol,
+        correlation_filter: CorrelationFilter,
+        analysis_repository: AnalysisRepository,
+        settings: Settings,
+    ) -> None:
+        self.client = client
+        self.ranker = ranker
+        self.correlation_filter = correlation_filter
+        self.analysis_repository = analysis_repository
+        self.settings = settings
+
+    async def match_analysis(self, analysis_id: int | None = None) -> MarketMatchResult:
+        analysis = await self._load_analysis(analysis_id)
+        if analysis is None:
+            raise MarketClientError("No analysis found to match against Polymarket.")
+
+        markets = await self.client.fetch_markets()
+        ranked_candidates = self.ranker.rank(analysis=analysis, markets=markets)
+        filtered_candidates = self.correlation_filter.apply(ranked_candidates)
+        top_candidates = filtered_candidates[: self.settings.market_top_n]
+
+        result = MarketMatchResult(
+            analysis_id=analysis.id,
+            news_item_id=analysis.news_item_id,
+            market_query=analysis.market_query,
+            fetch_mode=self.settings.market_fetch_mode.lower(),
+            match_strategy=self.settings.market_match_strategy.lower(),
+            fetched_count=len(markets),
+            candidate_count=len(top_candidates),
+            candidates=top_candidates,
+        )
+
+        await self.analysis_repository.save_market_matching_snapshot(
+            analysis_id=analysis.id,
+            snapshot={
+                "generated_at": datetime.now(UTC).isoformat(),
+                "fetch_mode": result.fetch_mode,
+                "match_strategy": result.match_strategy,
+                "fetched_count": result.fetched_count,
+                "candidate_count": result.candidate_count,
+                "candidates": [candidate.model_dump(mode="json") for candidate in top_candidates],
+            },
+        )
+
+        log_event(
+            logger,
+            "market_matching_completed",
+            analysis_id=analysis.id,
+            news_item_id=analysis.news_item_id,
+            fetched_count=result.fetched_count,
+            candidate_count=result.candidate_count,
+            market_query=result.market_query,
+        )
+        return result
+
+    async def _load_analysis(self, analysis_id: int | None) -> Analysis | None:
+        if analysis_id is not None:
+            return await self.analysis_repository.get_by_id(analysis_id)
+        return await self.analysis_repository.get_latest()
+
+
+def build_market_client(settings: Settings) -> MarketClientProtocol:
+    """Return either the fake provider or the real Gamma adapter."""
+    mode = settings.market_fetch_mode.lower()
+
+    if mode == "stub":
+        return StubPolymarketClient()
+
+    if mode == "gamma":
+        return GammaPolymarketClient(settings)
+
+    raise ValueError("Unsupported MARKET_FETCH_MODE. Expected 'stub' or 'gamma'.")
+
+
+def build_market_ranker(settings: Settings) -> MarketRankerProtocol:
+    """Return the selected matching strategy."""
+    strategy = settings.market_match_strategy.lower()
+
+    if strategy == "keyword":
+        return KeywordMarketRanker(settings)
+
+    raise ValueError(
+        "Unsupported MARKET_MATCH_STRATEGY. Expected 'keyword'. "
+        "Vector search / embeddings can be added later behind this adapter."
+    )
+
+
+async def run_market_matching(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    analysis_id: int | None = None,
+) -> MarketMatchResult:
+    """Convenience entrypoint for one market-matching run."""
+    service = MarketMatchingService(
+        client=build_market_client(settings),
+        ranker=build_market_ranker(settings),
+        correlation_filter=CorrelationFilter(settings),
+        analysis_repository=AnalysisRepository(session),
+        settings=settings,
+    )
+    return await service.match_analysis(analysis_id=analysis_id)
+
+
+def _tokenize(value: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", value.lower())
+    return {token for token in tokens if token not in STOPWORDS and len(token) > 1}
+
+
+def _token_overlap(query_tokens: set[str], document_tokens: set[str]) -> float:
+    if not query_tokens or not document_tokens:
+        return 0.0
+    return len(query_tokens & document_tokens) / len(query_tokens)
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
+def _scaled_liquidity(liquidity: float | None) -> float:
+    if not liquidity or liquidity <= 0:
+        return 0.0
+    return min(math.log10(liquidity + 1) / 6, 1.0)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Match one analysis to top-N Polymarket markets.")
+    parser.add_argument(
+        "--analysis-id",
+        type=int,
+        default=None,
+        help="Match a specific analyses.id. Defaults to the latest analysis.",
+    )
+    return parser.parse_args()
+
+
+async def _main() -> None:
+    args = _parse_args()
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
+    async with AsyncSessionLocal() as session:
+        result = await run_market_matching(session, settings, analysis_id=args.analysis_id)
+        print(result.model_dump_json())
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())

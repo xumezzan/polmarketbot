@@ -1,0 +1,331 @@
+import argparse
+import asyncio
+import logging
+from datetime import UTC, datetime
+from typing import Protocol
+
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    OpenAIError,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import Settings, get_settings
+from app.database import AsyncSessionLocal
+from app.logging_utils import configure_logging, log_event
+from app.models.analysis import Analysis
+from app.models.news import NewsItem
+from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.news_repo import NewsRepository
+from app.schemas.verdict import AnalysisRunResult, Verdict
+
+
+logger = logging.getLogger(__name__)
+
+
+class LLMAnalysisError(Exception):
+    """Raised when the LLM analysis step fails."""
+
+
+class LLMClientProtocol(Protocol):
+    """Interface for a structured verdict provider."""
+
+    async def analyze_news_item(self, news_item: NewsItem) -> tuple[Verdict, dict[str, object] | None]:
+        """Return a verdict and optional raw response payload."""
+
+
+class StubLLMClient:
+    """Deterministic fake analyzer for local end-to-end testing."""
+
+    async def analyze_news_item(self, news_item: NewsItem) -> tuple[Verdict, dict[str, object] | None]:
+        title = (news_item.title or "").lower()
+        content = (news_item.content or "").lower()
+        text = f"{title}\n{content}"
+
+        if "bitcoin" in text or "etf" in text or "crypto" in text:
+            verdict = Verdict(
+                relevance=0.86,
+                confidence=0.79,
+                direction="YES",
+                fair_probability=0.67,
+                market_query="bitcoin price",
+                reason=(
+                    "The article is directly about crypto market sentiment and suggests "
+                    "a positive move for a matching bitcoin-related market."
+                ),
+            )
+        elif "fed" in text or "rate" in text:
+            verdict = Verdict(
+                relevance=0.58,
+                confidence=0.68,
+                direction="NONE",
+                fair_probability=0.50,
+                market_query="federal reserve rates",
+                reason=(
+                    "The article matters for macro sentiment, but it does not give a "
+                    "clean binary edge for a Polymarket trade yet."
+                ),
+            )
+        else:
+            verdict = Verdict(
+                relevance=0.35,
+                confidence=0.40,
+                direction="NONE",
+                fair_probability=0.50,
+                market_query="general news",
+                reason=(
+                    "The article does not provide a clear, tradable event for a binary "
+                    "prediction market."
+                ),
+            )
+
+        raw_response = {
+            "provider": "stub",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "verdict": verdict.model_dump(mode="json"),
+        }
+        return verdict, raw_response
+
+
+class OpenAILLMClient:
+    """
+    OpenAI adapter for structured verdict generation.
+
+    Note:
+        The installed SDK version in this repo is `openai==1.51.0`, which supports
+        `beta.chat.completions.parse(...)` with a Pydantic model. Newer OpenAI docs
+        often recommend the Responses API, but this implementation intentionally uses
+        the current repo's compatible SDK surface instead of inventing unavailable methods.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        if not settings.openai_api_key:
+            raise LLMAnalysisError("OPENAI_API_KEY is required when LLM_MODE=openai")
+
+        self.settings = settings
+        self.client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            timeout=settings.openai_timeout_seconds,
+        )
+
+    async def analyze_news_item(self, news_item: NewsItem) -> tuple[Verdict, dict[str, object] | None]:
+        prompt = self._build_user_prompt(news_item)
+
+        try:
+            completion = await self.client.beta.chat.completions.parse(
+                model=self.settings.openai_model,
+                temperature=self.settings.openai_temperature,
+                max_completion_tokens=self.settings.openai_max_completion_tokens,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You analyze news for a Polymarket paper-trading bot. "
+                            "Return only a structured verdict that follows the schema. "
+                            "LLM is an advisor, not the final decision-maker. "
+                            "Be conservative. If the article is weak or ambiguous, use "
+                            "direction=NONE and fair_probability near 0.50."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                response_format=Verdict,
+            )
+        except (APITimeoutError, APIConnectionError, APIStatusError, OpenAIError) as exc:
+            request_id = getattr(exc, "request_id", None)
+            status_code = getattr(exc, "status_code", None)
+            log_event(
+                logger,
+                "llm_openai_request_failed",
+                provider="openai",
+                model=self.settings.openai_model,
+                news_item_id=news_item.id,
+                error=str(exc),
+                request_id=request_id,
+                status_code=status_code,
+            )
+            raise LLMAnalysisError(f"OpenAI analysis failed: {exc}") from exc
+
+        message = completion.choices[0].message
+        parsed_verdict = message.parsed
+
+        if parsed_verdict is None:
+            log_event(
+                logger,
+                "llm_openai_parse_failed",
+                provider="openai",
+                model=self.settings.openai_model,
+                news_item_id=news_item.id,
+            )
+            raise LLMAnalysisError("OpenAI returned no parsed verdict.")
+
+        raw_response = {
+            "provider": "openai",
+            "model": self.settings.openai_model,
+            "request_id": getattr(completion, "_request_id", None),
+            "message_content": message.content,
+            "verdict": parsed_verdict.model_dump(mode="json"),
+        }
+        return parsed_verdict, raw_response
+
+    def _build_user_prompt(self, news_item: NewsItem) -> str:
+        content = (news_item.content or "")[: self.settings.llm_max_content_chars]
+
+        return (
+            "Analyze the following news item for a Polymarket news trading bot.\n\n"
+            "Return a verdict with these meanings:\n"
+            "- relevance: how relevant this news is for prediction markets, 0 to 1\n"
+            "- confidence: how confident you are in your interpretation, 0 to 1\n"
+            "- direction: YES, NO, or NONE\n"
+            "- fair_probability: estimated fair probability for the best matching binary market, 0 to 1\n"
+            "- market_query: short search query to find the matching Polymarket market\n"
+            "- reason: short explanation in plain English\n\n"
+            f"Source: {news_item.source}\n"
+            f"Published at: {news_item.published_at}\n"
+            f"Title: {news_item.title}\n"
+            f"URL: {news_item.url}\n"
+            f"Content: {content}\n"
+        )
+
+
+def build_llm_client(settings: Settings) -> LLMClientProtocol:
+    """Return either a stub analyzer or the real OpenAI client."""
+    mode = settings.llm_mode.lower()
+
+    if mode == "stub":
+        return StubLLMClient()
+
+    if mode == "openai":
+        return OpenAILLMClient(settings)
+
+    raise ValueError("Unsupported LLM_MODE. Expected 'stub' or 'openai'.")
+
+
+class LLMAnalyzerService:
+    """Loads a news item, gets a verdict, and stores it in analyses."""
+
+    def __init__(
+        self,
+        *,
+        client: LLMClientProtocol,
+        news_repository: NewsRepository,
+        analysis_repository: AnalysisRepository,
+    ) -> None:
+        self.client = client
+        self.news_repository = news_repository
+        self.analysis_repository = analysis_repository
+
+    async def analyze_one(
+        self,
+        *,
+        news_item_id: int | None = None,
+        force: bool = False,
+    ) -> AnalysisRunResult:
+        news_item = await self._load_news_item(news_item_id)
+
+        if news_item is None:
+            raise LLMAnalysisError("No news item found to analyze.")
+
+        existing = await self.analysis_repository.get_by_news_item_id(news_item.id)
+        if existing is not None and not force:
+            verdict = self._analysis_to_verdict(existing)
+            log_event(
+                logger,
+                "llm_analysis_reused",
+                news_item_id=news_item.id,
+                analysis_id=existing.id,
+            )
+            return AnalysisRunResult(
+                news_item_id=news_item.id,
+                analysis_id=existing.id,
+                created_new=False,
+                verdict=verdict,
+            )
+
+        verdict, raw_response = await self.client.analyze_news_item(news_item)
+        analysis = await self.analysis_repository.create(
+            news_item_id=news_item.id,
+            verdict=verdict,
+            raw_response=raw_response,
+        )
+
+        log_event(
+            logger,
+            "llm_analysis_completed",
+            news_item_id=news_item.id,
+            analysis_id=analysis.id,
+            direction=verdict.direction,
+            relevance=verdict.relevance,
+            confidence=verdict.confidence,
+            fair_probability=verdict.fair_probability,
+        )
+        return AnalysisRunResult(
+            news_item_id=news_item.id,
+            analysis_id=analysis.id,
+            created_new=True,
+            verdict=verdict,
+        )
+
+    async def _load_news_item(self, news_item_id: int | None) -> NewsItem | None:
+        if news_item_id is not None:
+            return await self.news_repository.get_by_id(news_item_id)
+        return await self.news_repository.get_latest()
+
+    def _analysis_to_verdict(self, analysis: Analysis) -> Verdict:
+        return Verdict(
+            relevance=float(analysis.relevance),
+            confidence=float(analysis.confidence),
+            direction=analysis.direction.value,
+            fair_probability=float(analysis.fair_probability),
+            market_query=analysis.market_query,
+            reason=analysis.reason,
+        )
+
+
+async def run_llm_analysis(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    news_item_id: int | None = None,
+    force: bool = False,
+) -> AnalysisRunResult:
+    """Convenience entrypoint for a single analysis run."""
+    service = LLMAnalyzerService(
+        client=build_llm_client(settings),
+        news_repository=NewsRepository(session),
+        analysis_repository=AnalysisRepository(session),
+    )
+    return await service.analyze_one(news_item_id=news_item_id, force=force)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Analyze one news item with an LLM.")
+    parser.add_argument("--news-id", type=int, default=None, help="Analyze a specific news_items.id")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Create a new analysis even if one already exists for the news item.",
+    )
+    return parser.parse_args()
+
+
+async def _main() -> None:
+    args = _parse_args()
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
+    async with AsyncSessionLocal() as session:
+        result = await run_llm_analysis(
+            session,
+            settings,
+            news_item_id=args.news_id,
+            force=args.force,
+        )
+        print(result.model_dump_json())
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
