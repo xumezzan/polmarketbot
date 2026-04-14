@@ -38,20 +38,79 @@ class NewsApiClient:
         if not self.settings.news_api_key:
             raise NewsApiError("NEWS_API_KEY is required when NEWS_FETCH_MODE=newsapi")
 
+        lookback_candidates = resolve_news_lookback_hours_sequence(
+            primary_hours=self.settings.news_lookback_hours,
+            fallback_hours=self.settings.news_fallback_lookback_hours,
+            fallback_enabled=self.settings.news_enable_fallback_lookback,
+        )
+
+        last_payload: NewsApiResponse | None = None
+        for attempt_index, lookback_hours in enumerate(lookback_candidates, start=1):
+            payload = await self._fetch_everything(lookback_hours=lookback_hours)
+            last_payload = payload
+
+            if payload.articles:
+                log_event(
+                    logger,
+                    "news_api_fetch_completed",
+                    provider="newsapi",
+                    query=self.settings.news_query,
+                    fetched_count=len(payload.articles),
+                    total_results=payload.total_results,
+                    lookback_hours=lookback_hours,
+                    attempt=attempt_index,
+                )
+                return payload.articles
+
+            if attempt_index < len(lookback_candidates):
+                log_event(
+                    logger,
+                    "news_api_fetch_empty_retrying",
+                    provider="newsapi",
+                    query=self.settings.news_query,
+                    current_lookback_hours=lookback_hours,
+                    next_lookback_hours=lookback_candidates[attempt_index],
+                )
+
+        log_event(
+            logger,
+            "news_api_fetch_completed",
+            provider="newsapi",
+            query=self.settings.news_query,
+            fetched_count=0,
+            total_results=last_payload.total_results if last_payload is not None else 0,
+            lookback_hours=lookback_candidates[-1],
+            attempt=len(lookback_candidates),
+        )
+        return []
+
+    async def _fetch_everything(self, *, lookback_hours: int) -> NewsApiResponse:
         now = datetime.now(UTC)
-        from_dt = now - timedelta(hours=self.settings.news_lookback_hours)
+        from_dt = now - timedelta(hours=lookback_hours)
         url = f"{self.settings.news_api_base_url.rstrip('/')}/everything"
+
+        import random
+        page = random.randint(1, self.settings.news_max_pages)
 
         params = {
             "q": self.settings.news_query,
             "from": from_dt.isoformat(),
             "to": now.isoformat(),
             "language": self.settings.news_language,
-            "sortBy": "publishedAt",
+            "sortBy": self.settings.news_sort_by,
             "pageSize": self.settings.news_page_size,
-            "page": 1,
+            "page": page,
             "searchIn": self.settings.news_search_in,
         }
+
+        log_event(
+            logger,
+            "news_api_request_params",
+            page=page,
+            lookback_hours=lookback_hours,
+        )
+        if self.settings.news_exclude_domains.strip():
+            params["excludeDomains"] = self.settings.news_exclude_domains
 
         try:
             async with httpx.AsyncClient(
@@ -75,6 +134,7 @@ class NewsApiClient:
                 provider="newsapi",
                 error=str(exc),
                 response_text=response_text,
+                lookback_hours=lookback_hours,
             )
             raise NewsApiError(f"NewsAPI request failed: {exc}") from exc
 
@@ -84,16 +144,7 @@ class NewsApiClient:
             raise NewsApiError(
                 payload.message or payload.code or "NewsAPI returned an error response"
             )
-
-        log_event(
-            logger,
-            "news_api_fetch_completed",
-            provider="newsapi",
-            query=self.settings.news_query,
-            fetched_count=len(payload.articles),
-            total_results=payload.total_results,
-        )
-        return payload.articles
+        return payload
 
 
 class StubNewsClient:
@@ -175,8 +226,10 @@ class NewsIngestionService:
             fetched_count=len(articles),
             normalized_count=len(normalized_result.items),
             inserted_count=inserted_count,
+            filtered_out_count=normalized_result.filtered_out_count,
             skipped_count=(
                 normalized_result.invalid_count
+                + normalized_result.filtered_out_count
                 + normalized_result.duplicate_in_batch_count
                 + db_skipped_count
             ),
@@ -189,6 +242,7 @@ class NewsIngestionService:
             fetched_count=result.fetched_count,
             normalized_count=result.normalized_count,
             inserted_count=result.inserted_count,
+            filtered_out_count=result.filtered_out_count,
             skipped_count=result.skipped_count,
         )
         return result
@@ -207,12 +261,28 @@ def build_news_client(settings: Settings) -> NewsClientProtocol:
     raise ValueError("Unsupported NEWS_FETCH_MODE. Expected 'stub' or 'newsapi'.")
 
 
+def resolve_news_lookback_hours_sequence(
+    *,
+    primary_hours: int,
+    fallback_hours: int,
+    fallback_enabled: bool,
+) -> list[int]:
+    """Return the ordered lookback windows NewsAPI should try."""
+    if primary_hours <= 0:
+        primary_hours = 24
+
+    sequence = [primary_hours]
+    if fallback_enabled and fallback_hours > primary_hours:
+        sequence.append(fallback_hours)
+    return sequence
+
+
 async def run_news_ingestion(session: AsyncSession, settings: Settings) -> NewsImportResult:
     """Run one news import cycle."""
     repository = NewsRepository(session)
     service = NewsIngestionService(
         client=build_news_client(settings),
-        normalizer=NewsNormalizer(),
+        normalizer=NewsNormalizer(settings=settings),
         repository=repository,
         source_mode=settings.news_fetch_mode.lower(),
     )

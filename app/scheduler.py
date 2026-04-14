@@ -8,12 +8,18 @@ from app.database import AsyncSessionLocal
 from app.logging_utils import configure_logging, log_event
 from app.models.enums import SignalStatus
 from app.repositories.news_repo import NewsRepository
+from app.repositories.operator_state_repo import OperatorStateRepository
 from app.schemas.scheduler import PipelineItemResult, SchedulerCycleResult
 from app.services.alerting import AlertingService, build_alert_client
+from app.services.daily_report import run_daily_report
 from app.services.llm_analyzer import run_llm_analysis
 from app.services.market_client import run_market_matching
 from app.services.news_fetcher import run_news_ingestion
-from app.services.paper_trader import open_paper_position, run_paper_trade_maintenance
+from app.services.paper_trader import (
+    PaperTradingDisabledError,
+    open_paper_position,
+    run_paper_trade_maintenance,
+)
 from app.services.risk_engine import run_risk_engine
 from app.services.signal_engine import run_signal_engine
 
@@ -34,6 +40,7 @@ class PipelineScheduler:
             settings=settings,
             client=build_alert_client(settings),
         )
+        self._last_daily_report_date: str | None = None
 
     async def run_cycle(self) -> SchedulerCycleResult:
         """Run one full pipeline cycle."""
@@ -41,7 +48,16 @@ class PipelineScheduler:
         cycle_id = started_at.strftime("%Y%m%dT%H%M%S%fZ")
 
         async with AsyncSessionLocal() as session:
+            operator_state_repository = OperatorStateRepository(session)
+            await operator_state_repository.mark_cycle_started(started_at=started_at)
+
             maintenance_result = await run_paper_trade_maintenance(session, self.settings)
+            for close_result in maintenance_result.closed_results:
+                await self.alerting_service.send_trade_closed(
+                    cycle_id=cycle_id,
+                    trade=close_result,
+                )
+
             ingestion_result = await run_news_ingestion(session, self.settings)
             pending_news = await NewsRepository(session).list_without_analysis(
                 limit=self.settings.scheduler_news_batch_limit
@@ -97,12 +113,25 @@ class PipelineScheduler:
                         item_result.approved_signal_count += 1
                         approved_signal_count += 1
 
-                        trade_result = await open_paper_position(
-                            session,
-                            self.settings,
-                            signal_id=signal.signal_id,
-                            risk_decision=decision,
-                        )
+                        try:
+                            trade_result = await open_paper_position(
+                                session,
+                                self.settings,
+                                signal_id=signal.signal_id,
+                                risk_decision=decision,
+                            )
+                        except PaperTradingDisabledError as exc:
+                            item_result.blocked_signal_count += 1
+                            log_event(
+                                logger,
+                                "paper_trade_open_skipped",
+                                cycle_id=cycle_id,
+                                news_item_id=item_result.news_item_id,
+                                analysis_id=item_result.analysis_id,
+                                signal_id=signal.signal_id,
+                                reason=str(exc),
+                            )
+                            continue
                         item_result.opened_position_count += 1
                         item_result.opened_trade_ids.append(trade_result.trade_id)
                         opened_position_count += 1
@@ -142,7 +171,16 @@ class PipelineScheduler:
 
                 item_results.append(item_result)
 
-        finished_at = datetime.now(UTC)
+            finished_at = datetime.now(UTC)
+            error_count = sum(len(item.errors) for item in item_results)
+            await operator_state_repository.mark_cycle_completed(
+                started_at=started_at,
+                finished_at=finished_at,
+                fetched_news_count=ingestion_result.fetched_count,
+                inserted_news_count=ingestion_result.inserted_count,
+                error_count=error_count,
+            )
+
         result = SchedulerCycleResult(
             cycle_id=cycle_id,
             started_at=started_at.isoformat(),
@@ -158,7 +196,7 @@ class PipelineScheduler:
             opened_position_count=opened_position_count,
             auto_close_evaluated_count=maintenance_result.evaluated_positions,
             closed_position_count=closed_position_count,
-            error_count=sum(len(item.errors) for item in item_results),
+            error_count=error_count,
             item_results=item_results,
             closed_trade_ids=maintenance_result.closed_trade_ids,
         )
@@ -195,8 +233,52 @@ class PipelineScheduler:
 
         while True:
             cycle_number += 1
-            result = await self.run_cycle()
-            print(result.model_dump_json())
+            try:
+                result = await self.run_cycle()
+                print(result.model_dump_json())
+                await self._maybe_send_daily_report(cycle_number=cycle_number)
+            except Exception as exc:
+                log_event(
+                    logger,
+                    "scheduler_cycle_failed",
+                    cycle_number=cycle_number,
+                    error=str(exc),
+                )
+                try:
+                    async with AsyncSessionLocal() as session:
+                        await OperatorStateRepository(session).mark_cycle_failed(
+                            finished_at=datetime.now(UTC),
+                            error=str(exc),
+                        )
+                except Exception as state_exc:
+                    log_event(
+                        logger,
+                        "operator_state_update_failed",
+                        cycle_number=cycle_number,
+                        error=str(state_exc),
+                    )
+                await self.alerting_service.send_system_error(
+                    component="scheduler_cycle",
+                    error=str(exc),
+                    cycle_number=cycle_number,
+                )
+                await self._maybe_send_daily_report(cycle_number=cycle_number)
+                if not self.settings.scheduler_continue_on_item_error:
+                    raise
+
+                if max_cycles is not None and cycle_number >= max_cycles:
+                    return
+
+                next_run_at = datetime.now(UTC).timestamp() + max(interval, 0.0) * 60
+                log_event(
+                    logger,
+                    "scheduler_sleeping_after_error",
+                    cycle_number=cycle_number,
+                    sleep_seconds=round(max(interval, 0.0) * 60, 2),
+                    next_run_at=datetime.fromtimestamp(next_run_at, tz=UTC).isoformat(),
+                )
+                await asyncio.sleep(max(interval, 0.0) * 60)
+                continue
 
             if max_cycles is not None and cycle_number >= max_cycles:
                 return
@@ -210,6 +292,46 @@ class PipelineScheduler:
                 next_run_at=datetime.fromtimestamp(next_run_at, tz=UTC).isoformat(),
             )
             await asyncio.sleep(max(interval, 0.0) * 60)
+
+    async def _maybe_send_daily_report(self, *, cycle_number: int) -> None:
+        if not self.settings.alert_on_daily_report:
+            return
+
+        now = datetime.now(UTC)
+        report_date = now.date().isoformat()
+        if self._last_daily_report_date == report_date:
+            return
+
+        target_hour = min(max(self.settings.daily_report_hour_utc, 0), 23)
+        target_minute = min(max(self.settings.daily_report_minute_utc, 0), 59)
+        if (now.hour, now.minute) < (target_hour, target_minute):
+            return
+
+        try:
+            async with AsyncSessionLocal() as session:
+                report = await run_daily_report(
+                    session,
+                    self.settings,
+                    window_hours=max(self.settings.daily_report_window_hours, 1),
+                )
+            dispatch = await self.alerting_service.send_daily_report(report=report)
+            self._last_daily_report_date = report_date
+            log_event(
+                logger,
+                "daily_report_sent",
+                cycle_number=cycle_number,
+                report_date=report_date,
+                delivered=dispatch.delivered,
+                mode=dispatch.mode,
+                error=dispatch.error,
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                "daily_report_failed",
+                cycle_number=cycle_number,
+                error=str(exc),
+            )
 
 
 def _parse_args() -> argparse.Namespace:

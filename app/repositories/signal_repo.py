@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -27,6 +29,11 @@ class SignalRepository:
         """Return the latest signal with analysis/news context loaded."""
         stmt = self._with_context().order_by(Signal.id.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_recent(self, *, limit: int = 20) -> list[Signal]:
+        """Return latest signals with analysis/news context loaded."""
+        stmt = self._with_context().order_by(Signal.id.desc()).limit(limit)
+        return list((await self.session.execute(stmt)).scalars().all())
 
     async def get_by_analysis_and_market(
         self,
@@ -94,4 +101,13 @@ class SignalRepository:
     async def count(self) -> int:
         """Return total number of stored signals."""
         stmt = sa.select(sa.func.count()).select_from(Signal)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def count_created_since(self, *, since: datetime) -> int:
+        """Return signals count created since a timestamp."""
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(Signal)
+            .where(Signal.created_at >= since)
+        )
         return int((await self.session.execute(stmt)).scalar_one())

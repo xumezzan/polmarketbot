@@ -1,25 +1,35 @@
 import argparse
 import asyncio
 import logging
-from datetime import UTC, datetime
+from collections import Counter, defaultdict
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.database import AsyncSessionLocal
 from app.logging_utils import configure_logging, log_event
-from app.models.enums import MarketSide, VerdictDirection
+from app.models.enums import MarketSide, SignalStatus, VerdictDirection
 from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.runtime_flag_repo import RuntimeFlagRepository
 from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
+from app.runtime_flags import RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH
 from app.schemas.risk import RiskDecision
 from app.schemas.trade import (
+    PaperRiskBlockerCount,
+    PaperTradeAnalytics,
+    PaperTradeAnalyticsSummary,
     PaperTradeAutoCloseDecision,
+    PaperTradeBreakdownRow,
     PaperTradeCloseResult,
+    PaperTradeDailyAnalytics,
+    PaperTradeFunnelStats,
     PaperTradeMaintenanceResult,
     PaperTradeOpenResult,
     PaperTradeStats,
 )
+from app.services.alerting import AlertingService, build_alert_client
 from app.services.market_client import MarketClientProtocol, build_market_client
 from app.services.risk_engine import RiskEngine
 
@@ -29,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 class PaperTraderError(Exception):
     """Raised when a paper trade cannot be opened or closed."""
+
+
+class PaperTradingDisabledError(PaperTraderError):
+    """Raised when kill switch blocks opening a new paper trade."""
 
 
 def calculate_pnl(*, entry_price: float, exit_price: float, shares: float) -> float:
@@ -106,6 +120,201 @@ def evaluate_auto_close_case(
     return False, None, delta
 
 
+def build_paper_trade_analytics(
+    *,
+    generated_at: str,
+    period_days: int | None,
+    trade_rows: list[dict[str, object]],
+    current_open_positions: int,
+    analyses_count: int,
+    actionable_signal_count: int,
+    approved_signal_count: int,
+    blocked_signal_count: int,
+    blocker_counts: Counter[str],
+) -> PaperTradeAnalytics:
+    """Build one explainable analytics payload from normalized trade rows."""
+    opened_rows = [row for row in trade_rows if row.get("opened_in_period")]
+    closed_rows = [row for row in trade_rows if row.get("closed_in_period")]
+    pnl_values = [float(row["pnl"]) for row in closed_rows]
+    winning = [value for value in pnl_values if value > 0]
+    losing = [value for value in pnl_values if value < 0]
+    total_pnl = sum(pnl_values)
+    closed_count = len(closed_rows)
+    win_rate = len(winning) / closed_count if closed_count else 0.0
+    avg_pnl = total_pnl / closed_count if closed_count else 0.0
+    avg_win_pnl = sum(winning) / len(winning) if winning else 0.0
+    avg_loss_pnl = sum(losing) / len(losing) if losing else 0.0
+    expectancy = (win_rate * avg_win_pnl) + ((1 - win_rate) * avg_loss_pnl)
+    holding_values = [float(row["holding_minutes"]) for row in closed_rows]
+    avg_holding_minutes = (
+        sum(holding_values) / len(holding_values) if holding_values else 0.0
+    )
+
+    daily_map: dict[str, dict[str, float | int]] = defaultdict(
+        lambda: {
+            "opened_trades": 0,
+            "closed_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "total_pnl": 0.0,
+        }
+    )
+    for row in opened_rows:
+        opened_date = str(row["opened_date"])
+        daily_map[opened_date]["opened_trades"] += 1
+    for row in closed_rows:
+        closed_date = str(row["closed_date"])
+        daily_map[closed_date]["closed_trades"] += 1
+        pnl = float(row["pnl"])
+        daily_map[closed_date]["total_pnl"] += pnl
+        if pnl > 0:
+            daily_map[closed_date]["winning_trades"] += 1
+        elif pnl < 0:
+            daily_map[closed_date]["losing_trades"] += 1
+
+    daily = []
+    for date_key in sorted(daily_map):
+        row = daily_map[date_key]
+        closed_trades = int(row["closed_trades"])
+        total_day_pnl = float(row["total_pnl"])
+        daily.append(
+            PaperTradeDailyAnalytics(
+                date=date_key,
+                opened_trades=int(row["opened_trades"]),
+                closed_trades=closed_trades,
+                winning_trades=int(row["winning_trades"]),
+                losing_trades=int(row["losing_trades"]),
+                total_pnl=round(total_day_pnl, 4),
+                avg_pnl=round(total_day_pnl / closed_trades, 4) if closed_trades else 0.0,
+            )
+        )
+
+    by_market = _build_breakdown(
+        rows=closed_rows,
+        key_name="market_id",
+        label_name="market_question",
+    )
+    by_source = _build_breakdown(
+        rows=closed_rows,
+        key_name="news_source",
+        label_name="news_source",
+    )
+    risk_blockers = [
+        PaperRiskBlockerCount(blocker=blocker, count=count)
+        for blocker, count in blocker_counts.most_common()
+    ]
+    funnel = PaperTradeFunnelStats(
+        analyses=analyses_count,
+        actionable_signals=actionable_signal_count,
+        approved_signals=approved_signal_count,
+        blocked_signals=blocked_signal_count,
+        opened_trades=len(opened_rows),
+        closed_trades=closed_count,
+        analysis_to_actionable_rate=round(
+            actionable_signal_count / analyses_count, 4
+        )
+        if analyses_count
+        else 0.0,
+        actionable_to_approved_rate=round(
+            approved_signal_count / actionable_signal_count, 4
+        )
+        if actionable_signal_count
+        else 0.0,
+        approved_to_opened_rate=round( len(opened_rows) / approved_signal_count, 4)
+        if approved_signal_count
+        else 0.0,
+    )
+
+    return PaperTradeAnalytics(
+        generated_at=generated_at,
+        summary=PaperTradeAnalyticsSummary(
+            period_days=period_days,
+            opened_trades=len(opened_rows),
+            closed_trades=closed_count,
+            current_open_positions=current_open_positions,
+            winning_trades=len(winning),
+            losing_trades=len(losing),
+            win_rate=round(win_rate, 4),
+            avg_pnl=round(avg_pnl, 4),
+            total_pnl=round(total_pnl, 4),
+            avg_win_pnl=round(avg_win_pnl, 4),
+            avg_loss_pnl=round(avg_loss_pnl, 4),
+            expectancy=round(expectancy, 4),
+            avg_holding_minutes=round(avg_holding_minutes, 2),
+        ),
+        funnel=funnel,
+        daily=daily,
+        by_market=by_market,
+        by_source=by_source,
+        risk_blockers=risk_blockers,
+    )
+
+
+def _build_breakdown(
+    *,
+    rows: list[dict[str, object]],
+    key_name: str,
+    label_name: str,
+) -> list[PaperTradeBreakdownRow]:
+    grouped: dict[str, dict[str, object]] = defaultdict(
+        lambda: {
+            "label": "",
+            "trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "total_pnl": 0.0,
+            "holding_values": [],
+        }
+    )
+
+    for row in rows:
+        key = str(row.get(key_name) or "unknown")
+        label = str(row.get(label_name) or key)
+        bucket = grouped[key]
+        bucket["label"] = label
+        bucket["trades"] = int(bucket["trades"]) + 1
+
+        pnl = float(row["pnl"])
+        bucket["total_pnl"] = float(bucket["total_pnl"]) + pnl
+        if pnl > 0:
+            bucket["winning_trades"] = int(bucket["winning_trades"]) + 1
+        elif pnl < 0:
+            bucket["losing_trades"] = int(bucket["losing_trades"]) + 1
+        cast_holding_values = bucket["holding_values"]
+        assert isinstance(cast_holding_values, list)
+        cast_holding_values.append(float(row["holding_minutes"]))
+
+    result: list[PaperTradeBreakdownRow] = []
+    for key, bucket in grouped.items():
+        trades = int(bucket["trades"])
+        holding_values = bucket["holding_values"]
+        assert isinstance(holding_values, list)
+        total_pnl = float(bucket["total_pnl"])
+        result.append(
+            PaperTradeBreakdownRow(
+                key=key,
+                label=str(bucket["label"]),
+                trades=trades,
+                winning_trades=int(bucket["winning_trades"]),
+                losing_trades=int(bucket["losing_trades"]),
+                win_rate=round(int(bucket["winning_trades"]) / trades, 4) if trades else 0.0,
+                total_pnl=round(total_pnl, 4),
+                avg_pnl=round(total_pnl / trades, 4) if trades else 0.0,
+                avg_holding_minutes=round(sum(holding_values) / len(holding_values), 2)
+                if holding_values
+                else 0.0,
+            )
+        )
+
+    result.sort(key=lambda item: (item.total_pnl, item.trades), reverse=True)
+    return result
+
+
+def _normalize_blocker_name(blocker: str) -> str:
+    """Collapse parameterized blocker strings into stable blocker categories."""
+    return blocker.split(":", 1)[0]
+
+
 class PaperTrader:
     """Open, close, and summarize virtual trades."""
 
@@ -116,12 +325,14 @@ class PaperTrader:
         signal_repository: SignalRepository,
         analysis_repository: AnalysisRepository,
         trade_repository: TradeRepository,
+        runtime_flag_repository: RuntimeFlagRepository,
         market_client: MarketClientProtocol,
     ) -> None:
         self.settings = settings
         self.signal_repository = signal_repository
         self.analysis_repository = analysis_repository
         self.trade_repository = trade_repository
+        self.runtime_flag_repository = runtime_flag_repository
         self.market_client = market_client
         self.risk_engine = RiskEngine(
             settings=settings,
@@ -137,6 +348,19 @@ class PaperTrader:
         risk_decision: RiskDecision | None = None,
     ) -> PaperTradeOpenResult:
         """Open one paper position from an approved signal."""
+        kill_switch_enabled = await self.runtime_flag_repository.get_bool(
+            key=RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH,
+            default=False,
+        )
+        if kill_switch_enabled:
+            log_event(
+                logger,
+                "paper_trade_open_blocked_kill_switch",
+                signal_id=signal_id,
+                reason="paper_trading_kill_switch_enabled",
+            )
+            raise PaperTradingDisabledError("paper_trading_kill_switch_enabled")
+
         decision = risk_decision
         if decision is None and self.settings.paper_require_risk_approval:
             decision = await self.risk_engine.evaluate(signal_id=signal_id)
@@ -343,6 +567,73 @@ class PaperTrader:
         stats = await self.trade_repository.get_trade_statistics()
         return PaperTradeStats.model_validate(stats)
 
+    async def get_analytics(self, *, days: int | None = 7) -> PaperTradeAnalytics:
+        """Return paper-trading analytics for a recent period."""
+        generated_at = datetime.now(UTC)
+        if days is not None and days < 0:
+            raise PaperTraderError("days must be >= 0.")
+
+        since = None
+        if days == 0:
+            since = generated_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif days is not None:
+            since = generated_at - timedelta(days=days)
+
+        trades = await self.trade_repository.list_trades_with_context(since=since)
+        analyses = await self.analysis_repository.list_with_context(since=since)
+        current_open_positions = await self.trade_repository.count_open_positions()
+
+        trade_rows = [self._serialize_trade_row(trade=trade, since=since) for trade in trades]
+        actionable_signal_count = 0
+        approved_signal_count = 0
+        blocked_signal_count = 0
+        blocker_counts: Counter[str] = Counter()
+
+        for analysis in analyses:
+            actionable_signal_count += sum(
+                1
+                for signal in analysis.signals
+                if signal.signal_status == SignalStatus.ACTIONABLE
+            )
+
+            raw_response = analysis.raw_response or {}
+            snapshots = raw_response.get("snapshots") or {}
+            risk_snapshot = snapshots.get("risk_engine") or {}
+            decisions = risk_snapshot.get("decisions") or []
+            for decision in decisions:
+                if decision.get("allow"):
+                    approved_signal_count += 1
+                    continue
+
+                blocked_signal_count += 1
+                for blocker in decision.get("blockers") or []:
+                    blocker_counts[_normalize_blocker_name(str(blocker))] += 1
+
+        analytics = build_paper_trade_analytics(
+            generated_at=generated_at.isoformat(),
+            period_days=days,
+            trade_rows=trade_rows,
+            current_open_positions=current_open_positions,
+            analyses_count=len(analyses),
+            actionable_signal_count=actionable_signal_count,
+            approved_signal_count=approved_signal_count,
+            blocked_signal_count=blocked_signal_count,
+            blocker_counts=blocker_counts,
+        )
+        log_event(
+            logger,
+            "paper_trade_analytics_generated",
+            period_days=days,
+            opened_trades=analytics.summary.opened_trades,
+            closed_trades=analytics.summary.closed_trades,
+            current_open_positions=analytics.summary.current_open_positions,
+            total_pnl=analytics.summary.total_pnl,
+            actionable_signals=analytics.funnel.actionable_signals,
+            approved_signals=analytics.funnel.approved_signals,
+            blocked_signals=analytics.funnel.blocked_signals,
+        )
+        return analytics
+
     async def maintain_open_positions(self) -> PaperTradeMaintenanceResult:
         """Apply simple auto-close rules to every open paper position."""
         if not self.settings.paper_auto_close_enabled:
@@ -361,6 +652,7 @@ class PaperTrader:
         markets_by_id = {market.id: market for market in markets}
         decisions: list[PaperTradeAutoCloseDecision] = []
         closed_trade_ids: list[int] = []
+        closed_results: list[PaperTradeCloseResult] = []
 
         for position in open_positions:
             base_decision = {
@@ -448,6 +740,7 @@ class PaperTrader:
                 current_price_delta=current_price_delta,
             )
             closed_trade_ids.append(close_result.trade_id)
+            closed_results.append(close_result)
             decisions.append(
                 PaperTradeAutoCloseDecision(
                     **base_decision,
@@ -483,6 +776,7 @@ class PaperTrader:
             closed_positions=len(closed_trade_ids),
             skipped_positions=len(decisions) - len(closed_trade_ids),
             closed_trade_ids=closed_trade_ids,
+            closed_results=closed_results,
             decisions=decisions,
         )
         log_event(
@@ -494,6 +788,47 @@ class PaperTrader:
             closed_trade_ids=result.closed_trade_ids,
         )
         return result
+
+    def _serialize_trade_row(
+        self,
+        *,
+        trade,
+        since: datetime | None,
+    ) -> dict[str, object]:
+        signal = trade.signal
+        analysis = signal.analysis if signal is not None else None
+        news_item = analysis.news_item if analysis is not None else None
+        opened_in_period = since is None or trade.opened_at >= since
+        closed_in_period = (
+            trade.closed_at is not None and (since is None or trade.closed_at >= since)
+        )
+        holding_minutes = 0.0
+        if trade.closed_at is not None:
+            holding_minutes = round(
+                (trade.closed_at - trade.opened_at).total_seconds() / 60,
+                2,
+            )
+
+        return {
+            "trade_id": trade.id,
+            "signal_id": trade.signal_id,
+            "analysis_id": analysis.id if analysis is not None else None,
+            "news_item_id": analysis.news_item_id if analysis is not None else None,
+            "market_id": trade.market_id,
+            "market_question": (
+                signal.market_question if signal is not None and signal.market_question else trade.market_id
+            ),
+            "news_source": news_item.source if news_item is not None else "unknown",
+            "status": trade.status.value,
+            "opened_at": trade.opened_at,
+            "closed_at": trade.closed_at,
+            "opened_date": trade.opened_at.date().isoformat(),
+            "closed_date": trade.closed_at.date().isoformat() if trade.closed_at else None,
+            "opened_in_period": opened_in_period,
+            "closed_in_period": closed_in_period,
+            "pnl": float(trade.pnl or 0.0),
+            "holding_minutes": holding_minutes,
+        }
 
     async def _load_signal(self, signal_id: int | None):
         if signal_id is not None:
@@ -536,6 +871,7 @@ async def open_paper_position(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
     return await trader.open_position(signal_id=signal_id, risk_decision=risk_decision)
@@ -554,6 +890,7 @@ async def close_paper_position(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
     return await trader.close_position(
@@ -572,9 +909,28 @@ async def get_paper_trade_stats(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
     return await trader.get_stats()
+
+
+async def get_paper_trade_analytics(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    days: int | None = 7,
+) -> PaperTradeAnalytics:
+    """Convenience entrypoint to calculate paper-trading analytics."""
+    trader = PaperTrader(
+        settings=settings,
+        signal_repository=SignalRepository(session),
+        analysis_repository=AnalysisRepository(session),
+        trade_repository=TradeRepository(session),
+        runtime_flag_repository=RuntimeFlagRepository(session),
+        market_client=build_market_client(settings),
+    )
+    return await trader.get_analytics(days=days)
 
 
 async def run_paper_trade_maintenance(
@@ -587,6 +943,7 @@ async def run_paper_trade_maintenance(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
     return await trader.maintain_open_positions()
@@ -623,6 +980,16 @@ def _parse_args() -> argparse.Namespace:
         help="Evaluate open paper positions and auto-close the ones that hit exit rules.",
     )
     subparsers.add_parser("stats", help="Show paper-trading statistics.")
+    analytics_parser = subparsers.add_parser(
+        "analytics",
+        help="Show paper-trading analytics for the last N days.",
+    )
+    analytics_parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Analytics window in days. Use 0 for today only.",
+    )
     return parser.parse_args()
 
 
@@ -632,11 +999,20 @@ async def _main() -> None:
     configure_logging(settings.log_level)
 
     async with AsyncSessionLocal() as session:
+        alerting_service = AlertingService(
+            settings=settings,
+            client=build_alert_client(settings),
+        )
+
         if args.command == "open":
             result = await open_paper_position(
                 session,
                 settings,
                 signal_id=args.signal_id,
+            )
+            await alerting_service.send_trade_opened(
+                cycle_id="manual_cli",
+                trade=result,
             )
             print(result.model_dump_json())
             return
@@ -648,11 +1024,24 @@ async def _main() -> None:
                 position_id=args.position_id,
                 exit_price=args.exit_price,
             )
+            await alerting_service.send_trade_closed(
+                cycle_id="manual_cli",
+                trade=result,
+            )
             print(result.model_dump_json())
             return
 
         if args.command == "maintain":
             result = await run_paper_trade_maintenance(session, settings)
+            print(result.model_dump_json())
+            return
+
+        if args.command == "analytics":
+            result = await get_paper_trade_analytics(
+                session,
+                settings,
+                days=args.days,
+            )
             print(result.model_dump_json())
             return
 

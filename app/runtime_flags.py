@@ -1,0 +1,2 @@
+RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH = "paper_trading_kill_switch"
+

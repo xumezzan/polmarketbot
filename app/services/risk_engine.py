@@ -75,10 +75,20 @@ class RiskEngine:
         )
 
         approved_size_usd = 0.0
+        used_extended_news_age_window = should_use_extended_news_age_window(
+            settings=self.settings,
+            news_age_minutes=news_age_minutes,
+        )
+        effective_news_age_limit_minutes = resolve_news_age_limit_minutes(self.settings)
+        approved_size_multiplier = resolve_news_age_size_multiplier(
+            settings=self.settings,
+            news_age_minutes=news_age_minutes,
+        )
         if risk_result.allow:
             approved_size_usd = self._approved_size_usd(
                 liquidity=liquidity,
                 daily_exposure_used_usd=daily_exposure_used,
+                size_multiplier=approved_size_multiplier,
             )
 
         decision = RiskDecision(
@@ -97,6 +107,10 @@ class RiskEngine:
                 "confidence": float(analysis.confidence),
                 "relevance": float(analysis.relevance),
                 "news_age_minutes": news_age_minutes,
+                "base_news_age_limit_minutes": self.settings.risk_max_news_age_minutes,
+                "effective_news_age_limit_minutes": effective_news_age_limit_minutes,
+                "used_extended_news_age_window": used_extended_news_age_window,
+                "news_age_size_multiplier": approved_size_multiplier,
                 "liquidity": liquidity,
                 "daily_exposure_used_usd": round(daily_exposure_used, 2),
                 "existing_open_position": has_existing_position,
@@ -169,17 +183,60 @@ class RiskEngine:
         *,
         liquidity: float,
         daily_exposure_used_usd: float,
+        size_multiplier: float,
     ) -> float:
         daily_remaining = max(
             self.settings.risk_max_daily_exposure_usd - daily_exposure_used_usd,
             0.0,
         )
         liquidity_cap = liquidity * self.settings.risk_max_liquidity_share
-        return min(
+        capped_size = min(
             self.settings.risk_max_trade_size_usd,
             daily_remaining,
             liquidity_cap,
         )
+        return capped_size * size_multiplier
+
+
+def resolve_news_age_limit_minutes(settings: Settings) -> int:
+    """Return the currently effective freshness limit."""
+    if not settings.risk_enable_extended_news_age_window:
+        return settings.risk_max_news_age_minutes
+
+    return max(
+        settings.risk_max_news_age_minutes,
+        settings.risk_extended_max_news_age_minutes,
+    )
+
+
+def should_use_extended_news_age_window(
+    *,
+    settings: Settings,
+    news_age_minutes: int,
+) -> bool:
+    """Return True when an older signal is only allowed by the extended paper window."""
+    if not settings.risk_enable_extended_news_age_window:
+        return False
+
+    return (
+        news_age_minutes > settings.risk_max_news_age_minutes
+        and news_age_minutes <= resolve_news_age_limit_minutes(settings)
+    )
+
+
+def resolve_news_age_size_multiplier(
+    *,
+    settings: Settings,
+    news_age_minutes: int,
+) -> float:
+    """Reduce size for older-but-still-allowed paper trades."""
+    if should_use_extended_news_age_window(
+        settings=settings,
+        news_age_minutes=news_age_minutes,
+    ):
+        return settings.risk_extended_news_age_size_multiplier
+
+    return 1.0
 
 
 def evaluate_risk_case(
@@ -198,6 +255,11 @@ def evaluate_risk_case(
     Pure deterministic helper for local verification and unit tests.
     """
     blockers: list[str] = []
+    effective_news_age_limit_minutes = resolve_news_age_limit_minutes(settings)
+    approved_size_multiplier = resolve_news_age_size_multiplier(
+        settings=settings,
+        news_age_minutes=news_age_minutes,
+    )
 
     if signal_status != SignalStatus.ACTIONABLE.value:
         blockers.append(f"signal_not_actionable:{signal_status}")
@@ -212,9 +274,9 @@ def evaluate_risk_case(
             f"relevance_below_threshold:{relevance:.4f}<{settings.risk_min_relevance:.4f}"
         )
 
-    if news_age_minutes > settings.risk_max_news_age_minutes:
+    if news_age_minutes > effective_news_age_limit_minutes:
         blockers.append(
-            f"news_too_old:{news_age_minutes}>{settings.risk_max_news_age_minutes}"
+            f"news_too_old:{news_age_minutes}>{effective_news_age_limit_minutes}"
         )
 
     if liquidity < settings.risk_min_market_liquidity:
@@ -252,6 +314,7 @@ def evaluate_risk_case(
             daily_remaining,
             liquidity_cap,
         )
+        approved_size_usd *= approved_size_multiplier
         if approved_size_usd <= 0:
             allow = False
             blockers.append("approved_size_non_positive")

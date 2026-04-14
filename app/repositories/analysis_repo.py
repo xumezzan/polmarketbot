@@ -1,5 +1,8 @@
+from datetime import datetime
+
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.analysis import Analysis
 from app.models.enums import VerdictDirection
@@ -11,6 +14,12 @@ class AnalysisRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+
+    def _with_context(self) -> sa.Select[tuple[Analysis]]:
+        return sa.select(Analysis).options(
+            selectinload(Analysis.news_item),
+            selectinload(Analysis.signals),
+        )
 
     async def _save_snapshot(
         self,
@@ -42,6 +51,31 @@ class AnalysisRepository:
         """Return the latest stored analysis."""
         stmt = sa.select(Analysis).order_by(Analysis.id.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def count(self) -> int:
+        """Return total number of analysis rows."""
+        stmt = sa.select(sa.func.count()).select_from(Analysis)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def count_created_since(self, *, since: datetime) -> int:
+        """Return analyses count created since a timestamp."""
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(Analysis)
+            .where(Analysis.created_at >= since)
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def list_with_context(
+        self,
+        *,
+        since: datetime | None = None,
+    ) -> list[Analysis]:
+        """Return analyses with linked news/signals for analytics and reporting."""
+        stmt = self._with_context().order_by(Analysis.id)
+        if since is not None:
+            stmt = stmt.where(Analysis.created_at >= since)
+        return list((await self.session.execute(stmt)).scalars().all())
 
     async def get_by_news_item_id(self, news_item_id: int) -> Analysis | None:
         """Return the latest analysis for a news item if one exists."""

@@ -22,12 +22,23 @@ class Settings(BaseSettings):
 
     news_fetch_mode: str = "stub"
     news_api_base_url: str = "https://newsapi.org/v2"
-    news_query: str = "bitcoin OR ethereum OR crypto"
+    news_query: str = (
+        '(bitcoin OR ethereum OR crypto OR ETF OR "Federal Reserve" '
+        'OR inflation OR tariff OR recession OR election) '
+        'NOT (auction OR "No Reserve" OR "Bring a Trailer")'
+    )
     news_language: str = "en"
     news_page_size: int = 20
+    news_max_pages: int = 5
     news_lookback_hours: int = 24
-    news_search_in: str = "title,description,content"
+    news_enable_fallback_lookback: bool = True
+    news_fallback_lookback_hours: int = 72
+    news_search_in: str = "title,description"
+    news_sort_by: str = "relevancy"
+    news_exclude_domains: str = "bringatrailer.com"
     news_api_timeout_seconds: float = 15.0
+    news_relevance_filter_enabled: bool = True
+    news_relevance_min_hits: int = 2
     llm_mode: str = "stub"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
@@ -61,6 +72,9 @@ class Settings(BaseSettings):
     risk_min_confidence: float = 0.70
     risk_min_relevance: float = 0.65
     risk_max_news_age_minutes: int = 360
+    risk_enable_extended_news_age_window: bool = False
+    risk_extended_max_news_age_minutes: int = 1800
+    risk_extended_news_age_size_multiplier: float = 0.5
     risk_min_market_liquidity: float = 10000.0
     risk_priced_in_edge_threshold: float = 0.03
     risk_max_daily_exposure_usd: float = 250.0
@@ -75,10 +89,17 @@ class Settings(BaseSettings):
     scheduler_interval_minutes: float = 15.0
     scheduler_news_batch_limit: int = 10
     scheduler_continue_on_item_error: bool = True
+    operator_recent_signals_default_limit: int = 20
+    operator_recent_signals_max_limit: int = 100
     alert_mode: str = "noop"
     alert_on_trade_opened: bool = True
+    alert_on_trade_closed: bool = True
     alert_on_scheduler_error: bool = True
     alert_on_cycle_summary: bool = False
+    alert_on_daily_report: bool = True
+    daily_report_window_hours: int = 24
+    daily_report_hour_utc: int = 0
+    daily_report_minute_utc: int = 10
     telegram_api_base_url: str = "https://api.telegram.org"
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

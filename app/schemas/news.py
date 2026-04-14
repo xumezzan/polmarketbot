@@ -64,6 +64,7 @@ class NormalizationResult(BaseModel):
     items: list[NormalizedNewsItem]
     invalid_count: int = 0
     duplicate_in_batch_count: int = 0
+    filtered_out_count: int = 0
 
 
 class NewsImportResult(BaseModel):
@@ -74,3 +75,4 @@ class NewsImportResult(BaseModel):
     normalized_count: int
     inserted_count: int
     skipped_count: int
+    filtered_out_count: int = 0

@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from datetime import datetime
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,6 +68,15 @@ class NewsRepository:
     async def count(self) -> int:
         """Return total number of stored news rows."""
         stmt = sa.select(sa.func.count()).select_from(NewsItem)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def count_created_since(self, *, since: datetime) -> int:
+        """Return number of news rows inserted since a timestamp."""
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(NewsItem)
+            .where(NewsItem.created_at >= since)
+        )
         return int((await self.session.execute(stmt)).scalar_one())
 
     async def get_by_id(self, news_item_id: int) -> NewsItem | None:

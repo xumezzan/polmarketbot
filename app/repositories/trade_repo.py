@@ -24,6 +24,14 @@ class TradeRepository:
             .selectinload(Analysis.news_item),
         )
 
+    def _trade_with_context(self) -> sa.Select[tuple[PaperTrade]]:
+        return sa.select(PaperTrade).options(
+            selectinload(PaperTrade.signal)
+            .selectinload(Signal.analysis)
+            .selectinload(Analysis.news_item),
+            selectinload(PaperTrade.position),
+        )
+
     async def get_daily_exposure_used_usd(self, *, day_start: datetime) -> float:
         """Return total paper trade size opened since day_start."""
         stmt = sa.select(sa.func.coalesce(sa.func.sum(PaperTrade.size_usd), 0)).where(
@@ -80,6 +88,69 @@ class TradeRepository:
             .limit(1)
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_trades_with_context(
+        self,
+        *,
+        since: datetime | None = None,
+    ) -> list[PaperTrade]:
+        """Return paper trades with signal/analysis/news context for analytics."""
+        stmt = self._trade_with_context().order_by(PaperTrade.id)
+        if since is not None:
+            stmt = stmt.where(
+                sa.or_(
+                    PaperTrade.opened_at >= since,
+                    PaperTrade.closed_at >= since,
+                )
+            )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def count_open_positions(self) -> int:
+        """Return the current number of open paper positions."""
+        stmt = sa.select(sa.func.count()).select_from(Position).where(
+            Position.status == PositionStatus.OPEN
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def count_trades(self) -> int:
+        """Return total number of paper trades."""
+        stmt = sa.select(sa.func.count()).select_from(PaperTrade)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def count_opened_trades_since(self, *, since: datetime) -> int:
+        """Return paper trades opened since timestamp."""
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(PaperTrade)
+            .where(PaperTrade.opened_at >= since)
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def count_closed_trades_since(self, *, since: datetime) -> int:
+        """Return paper trades closed since timestamp."""
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(PaperTrade)
+            .where(
+                PaperTrade.status == TradeStatus.CLOSED,
+                PaperTrade.closed_at.is_not(None),
+                PaperTrade.closed_at >= since,
+            )
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def sum_realized_pnl_since(self, *, since: datetime) -> float:
+        """Return sum of realized PnL for trades closed since timestamp."""
+        stmt = (
+            sa.select(sa.func.coalesce(sa.func.sum(PaperTrade.pnl), 0))
+            .select_from(PaperTrade)
+            .where(
+                PaperTrade.status == TradeStatus.CLOSED,
+                PaperTrade.closed_at.is_not(None),
+                PaperTrade.closed_at >= since,
+            )
+        )
+        return float((await self.session.execute(stmt)).scalar_one())
 
     async def open_virtual_trade(
         self,
