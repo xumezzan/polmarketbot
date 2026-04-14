@@ -102,6 +102,8 @@ class Settings(BaseSettings):
     daily_report_minute_utc: int = 10
     telegram_api_base_url: str = "https://api.telegram.org"
     telegram_bot_token: str = ""
+    telegram_webhook_url: str = ""
+    telegram_enabled: bool = True
     telegram_chat_id: str = ""
     telegram_request_timeout_seconds: float = 10.0
     telegram_disable_notification: bool = False
