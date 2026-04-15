@@ -12,9 +12,15 @@ from app.logging_utils import configure_logging, log_event
 from app.models.enums import MarketSide
 from app.repositories.analysis_repo import AnalysisRepository
 from app.repositories.news_repo import NewsRepository
+from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
-from app.schemas.daily_report import BlockerStat, DailyReport
+from app.schemas.daily_report import (
+    BlockerStat,
+    DailyReport,
+    ProviderCooldownStat,
+    ProviderFailureStat,
+)
 from app.services.alerting import AlertingService, build_alert_client
 from app.services.market_client import MarketClientProtocol, build_market_client
 
@@ -33,6 +39,7 @@ class DailyReportService:
         analysis_repository: AnalysisRepository,
         signal_repository: SignalRepository,
         trade_repository: TradeRepository,
+        scheduler_cycle_repository: SchedulerCycleRepository,
         market_client: MarketClientProtocol,
     ) -> None:
         self.settings = settings
@@ -40,12 +47,29 @@ class DailyReportService:
         self.analysis_repository = analysis_repository
         self.signal_repository = signal_repository
         self.trade_repository = trade_repository
+        self.scheduler_cycle_repository = scheduler_cycle_repository
         self.market_client = market_client
 
     async def build(self, *, window_hours: int = 24) -> DailyReport:
         now = datetime.now(UTC)
         since = now - timedelta(hours=window_hours)
 
+        fetched_news = await self.scheduler_cycle_repository.sum_fetched_news_since(since=since)
+        scheduler_cycles = await self.scheduler_cycle_repository.count_cycles_since(since=since)
+        failed_cycles = await self.scheduler_cycle_repository.count_failed_cycles_since(since=since)
+        actionable_signals = await self.scheduler_cycle_repository.sum_actionable_signals_since(
+            since=since
+        )
+        consecutive_failed_cycles = await self.scheduler_cycle_repository.count_consecutive_failed_cycles()
+        consecutive_idle_cycles = await self.scheduler_cycle_repository.count_consecutive_idle_cycles()
+        latest_successful_cycle = await self.scheduler_cycle_repository.get_latest_completed()
+        provider_failures = await self.scheduler_cycle_repository.get_provider_failure_counts_since(
+            since=since
+        )
+        provider_cooldowns = await self.scheduler_cycle_repository.get_active_provider_cooldowns(
+            now=now,
+            newsapi_cooldown_minutes=self.settings.news_rate_limit_cooldown_minutes,
+        )
         inserted_news = await self.news_repository.count_created_since(since=since)
         analyses = await self.analysis_repository.list_with_context(since=since)
         signals_count = await self.signal_repository.count_created_since(since=since)
@@ -66,9 +90,22 @@ class DailyReportService:
         ) = await self._compute_unrealized_pnl()
 
         notes: list[str] = []
-        notes.append(
-            "fetched_news_24h is unavailable because ingestion fetched counts are not persisted in PostgreSQL yet."
-        )
+        if failed_cycles > 0:
+            notes.append(f"failed_scheduler_cycles_24h={failed_cycles}")
+        if consecutive_failed_cycles > 0:
+            notes.append(f"consecutive_failed_cycles={consecutive_failed_cycles}")
+        if consecutive_idle_cycles > 0:
+            notes.append(f"consecutive_idle_cycles={consecutive_idle_cycles}")
+        if provider_cooldowns:
+            notes.extend(
+                [
+                    (
+                        "provider_cooldown_active:"
+                        f"{provider}:remaining_seconds={remaining_seconds}"
+                    )
+                    for provider, _cooldown_until, remaining_seconds, _reason in provider_cooldowns
+                ]
+            )
         if unrealized_note:
             notes.append(unrealized_note)
 
@@ -76,10 +113,20 @@ class DailyReportService:
             generated_at=now.isoformat(),
             window_start=since.isoformat(),
             window_end=now.isoformat(),
-            fetched_news_24h=None,
+            fetched_news_24h=fetched_news,
+            scheduler_cycles_24h=scheduler_cycles,
+            failed_cycles_24h=failed_cycles,
+            consecutive_failed_cycles=consecutive_failed_cycles,
+            consecutive_idle_cycles=consecutive_idle_cycles,
+            last_successful_cycle_at=(
+                latest_successful_cycle.finished_at.isoformat()
+                if latest_successful_cycle is not None and latest_successful_cycle.finished_at is not None
+                else None
+            ),
             inserted_news_24h=inserted_news,
             analyses_count_24h=len(analyses),
             signals_count_24h=signals_count,
+            actionable_signals_count_24h=actionable_signals,
             approved_signals_count_24h=approved_signals,
             opened_paper_trades_24h=opened_trades,
             closed_paper_trades_24h=closed_trades,
@@ -88,6 +135,19 @@ class DailyReportService:
             unrealized_pnl=unrealized_pnl,
             unrealized_positions_valued=unrealized_positions_valued,
             unrealized_positions_total=unrealized_positions_total,
+            provider_failures=[
+                ProviderFailureStat(provider=provider, count=count)
+                for provider, count in provider_failures
+            ],
+            provider_cooldowns=[
+                ProviderCooldownStat(
+                    provider=provider,
+                    cooldown_until=cooldown_until.isoformat(),
+                    remaining_seconds=remaining_seconds,
+                    reason=reason,
+                )
+                for provider, cooldown_until, remaining_seconds, reason in provider_cooldowns
+            ],
             top_blockers=[
                 BlockerStat(reason=reason, count=count)
                 for reason, count in blocker_counter.most_common(5)
@@ -97,6 +157,13 @@ class DailyReportService:
         log_event(
             logger,
             "daily_report_built",
+            fetched_news_24h=report.fetched_news_24h,
+            scheduler_cycles_24h=report.scheduler_cycles_24h,
+            failed_cycles_24h=report.failed_cycles_24h,
+            consecutive_failed_cycles=report.consecutive_failed_cycles,
+            consecutive_idle_cycles=report.consecutive_idle_cycles,
+            provider_cooldowns_active=len(report.provider_cooldowns),
+            actionable_signals_count_24h=report.actionable_signals_count_24h,
             inserted_news_24h=report.inserted_news_24h,
             analyses_count_24h=report.analyses_count_24h,
             signals_count_24h=report.signals_count_24h,
@@ -237,6 +304,7 @@ async def run_daily_report(
         analysis_repository=AnalysisRepository(session),
         signal_repository=SignalRepository(session),
         trade_repository=TradeRepository(session),
+        scheduler_cycle_repository=SchedulerCycleRepository(session),
         market_client=build_market_client(settings),
     )
     return await service.build(window_hours=window_hours)

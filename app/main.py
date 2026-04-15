@@ -12,6 +12,7 @@ from app.repositories.analysis_repo import AnalysisRepository
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
 from app.repositories.runtime_flag_repo import RuntimeFlagRepository
+from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
 from app.runtime_flags import RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH
@@ -22,7 +23,7 @@ from app.schemas.admin import (
     OpenPositionsResponse,
     RecentSignalsResponse,
 )
-from app.services.alerting import AlertingService, build_alert_client
+from app.services.alerting import AlertingService, build_alert_client, get_alerting_runtime_status
 from app.services.monitor import MonitorService
 from app.services.operator import OperatorService
 from app.schemas.monitor import SystemVerificationReport
@@ -38,12 +39,31 @@ app = FastAPI(title=settings.app_name)
 
 def _build_operator_service(session: AsyncSession) -> OperatorService:
     return OperatorService(
+        settings=settings,
         news_repository=NewsRepository(session),
         analysis_repository=AnalysisRepository(session),
         signal_repository=SignalRepository(session),
         trade_repository=TradeRepository(session),
         runtime_flag_repository=RuntimeFlagRepository(session),
         operator_state_repository=OperatorStateRepository(session),
+        scheduler_cycle_repository=SchedulerCycleRepository(session),
+    )
+
+
+@app.on_event("startup")
+async def app_startup() -> None:
+    """Log a compact startup validation snapshot for operator visibility."""
+    alerting_status = get_alerting_runtime_status(settings)
+    log_event(
+        logger,
+        "app_startup_completed",
+        app_name=settings.app_name,
+        app_env=settings.app_env,
+        alert_mode=alerting_status["mode"],
+        alerting_status=alerting_status["status"],
+        alerting_enabled=alerting_status["enabled"],
+        alerting_reason=alerting_status["reason"] or None,
+        telegram_enabled=settings.telegram_enabled,
     )
 
 
@@ -102,6 +122,7 @@ async def admin_verify(
     monitor = MonitorService(
         settings=settings,
         operator_state_repository=OperatorStateRepository(session),
+        scheduler_cycle_repository=SchedulerCycleRepository(session),
         news_repository=NewsRepository(session),
         trade_repository=TradeRepository(session),
     )
@@ -340,19 +361,26 @@ def _format_status_message(status: AdminStatusResponse) -> str:
     pipeline_text = "жив ✅" if pipeline_alive else "нет новых циклов ⚠️"
     kill_switch_text = "ON 🛑" if status.kill_switch_enabled else "OFF ▶️"
     last_cycle = status.last_scheduler_cycle_finished_at or "n/a"
+    cooldown_lines = []
+    for provider, payload in status.provider_cooldowns.items():
+        remaining_seconds = payload.get("remaining_seconds")
+        if isinstance(remaining_seconds, (int, float)):
+            cooldown_lines.append(
+                f"Cooldown {provider}: <code>{int(remaining_seconds)}s</code>"
+            )
 
-    return "\n".join(
-        [
-            "<b>📊 Статус системы</b>",
-            f"API: <b>жив ✅</b>",
-            f"Pipeline: <b>{pipeline_text}</b>",
-            f"Последний цикл: <code>{escape(last_cycle)}</code>",
-            f"Новости (24ч): <code>{status.inserted_news_24h}</code>",
-            f"Сигналы (24ч): <code>{status.signals_count_24h}</code>",
-            f"Открытые позиции: <code>{status.open_positions_count}</code>",
-            f"Kill switch: <b>{kill_switch_text}</b>",
-        ]
-    )
+    lines = [
+        "<b>📊 Статус системы</b>",
+        f"API: <b>жив ✅</b>",
+        f"Pipeline: <b>{pipeline_text}</b>",
+        f"Последний цикл: <code>{escape(last_cycle)}</code>",
+        f"Новости (24ч): <code>{status.inserted_news_24h}</code>",
+        f"Сигналы (24ч): <code>{status.signals_count_24h}</code>",
+        f"Открытые позиции: <code>{status.open_positions_count}</code>",
+        f"Kill switch: <b>{kill_switch_text}</b>",
+    ]
+    lines.extend(cooldown_lines)
+    return "\n".join(lines)
 
 
 async def _format_recent_trades_message(*, session: AsyncSession) -> str:

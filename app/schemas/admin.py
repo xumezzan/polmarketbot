@@ -28,6 +28,10 @@ class AdminStatusResponse(BaseModel):
     paper_trades_count: int = 0
     open_positions_count: int = 0
     kill_switch_enabled: bool = False
+    fetched_news_24h: int = 0
+    scheduler_cycles_24h: int = 0
+    failed_cycles_24h: int = 0
+    provider_cooldowns: dict[str, dict[str, object]] = Field(default_factory=dict)
     inserted_news_24h: int = 0
     analyses_count_24h: int = 0
     signals_count_24h: int = 0

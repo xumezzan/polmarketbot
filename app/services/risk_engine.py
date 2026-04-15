@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings, get_settings
 from app.database import AsyncSessionLocal
 from app.logging_utils import configure_logging, log_event
-from app.models.enums import SignalStatus
+from app.models.enums import SignalStatus, VerdictDirection
 from app.models.signal import Signal
 from app.repositories.analysis_repo import AnalysisRepository
 from app.repositories.signal_repo import SignalRepository
@@ -104,11 +104,37 @@ class RiskEngine:
         has_existing_position = await self.trade_repository.has_open_position_for_market(
             market_id=signal.market_id
         )
+        entity_tokens = _extract_query_entity_tokens(
+            query_text=analysis.market_query or "",
+            max_tokens=self.settings.risk_anchor_entity_max_tokens,
+        )
+        entity_key = _build_entity_key(entity_tokens)
+        entity_open_positions_count, entity_open_exposure_used_usd = (
+            await self._entity_exposure_context(current_entity_tokens=entity_tokens)
+        )
         analysis_trade_count = await self.trade_repository.count_trades_for_analysis(
             analysis_id=signal.analysis_id
         )
         top_match_score, second_match_score, top_candidate_score_delta = (
             self._load_market_match_score_context(signal)
+        )
+        overlap_count, max_overlap_token_length = _query_market_overlap_stats(
+            query_text=analysis.market_query or "",
+            market_question=candidate.question,
+        )
+        anchor_overlap_count, query_anchor_tokens = _query_market_anchor_stats(
+            settings=self.settings,
+            query_text=analysis.market_query or "",
+            market_question=candidate.question,
+        )
+        bid_ask_spread = _resolve_bid_ask_spread(
+            best_bid=candidate.best_bid,
+            best_ask=candidate.best_ask,
+        )
+        yes_entry_slippage = _resolve_yes_entry_slippage(
+            direction=analysis.direction.value,
+            reference_market_price=float(signal.market_price),
+            best_ask=candidate.best_ask,
         )
 
         risk_result = evaluate_risk_case(
@@ -123,19 +149,14 @@ class RiskEngine:
             query_text=analysis.market_query or "",
             market_question=candidate.question,
             existing_open_position=has_existing_position,
+            entity_key=entity_key,
+            entity_open_positions_count=entity_open_positions_count,
+            entity_open_exposure_used_usd=entity_open_exposure_used_usd,
+            bid_ask_spread=bid_ask_spread,
+            yes_entry_slippage=yes_entry_slippage,
             analysis_trade_count=analysis_trade_count,
             daily_exposure_used_usd=daily_exposure_used,
             top_candidate_score_delta=top_candidate_score_delta,
-        )
-
-        overlap_count, max_overlap_token_length = _query_market_overlap_stats(
-            query_text=analysis.market_query or "",
-            market_question=candidate.question,
-        )
-        anchor_overlap_count, query_anchor_tokens = _query_market_anchor_stats(
-            settings=self.settings,
-            query_text=analysis.market_query or "",
-            market_question=candidate.question,
         )
 
         approved_size_usd = 0.0
@@ -152,6 +173,8 @@ class RiskEngine:
             approved_size_usd = self._approved_size_usd(
                 liquidity=liquidity,
                 daily_exposure_used_usd=daily_exposure_used,
+                entity_key=entity_key,
+                entity_open_exposure_used_usd=entity_open_exposure_used_usd,
                 size_multiplier=approved_size_multiplier,
             )
 
@@ -185,6 +208,17 @@ class RiskEngine:
                 "query_anchor_tokens": ",".join(sorted(query_anchor_tokens)) or None,
                 "anchor_overlap_count": anchor_overlap_count,
                 "min_anchor_overlap_count": self.settings.risk_min_anchor_entity_overlap,
+                "entity_key": entity_key,
+                "entity_open_positions_count": entity_open_positions_count,
+                "max_open_positions_per_entity": self.settings.risk_max_open_positions_per_entity,
+                "entity_open_exposure_used_usd": round(entity_open_exposure_used_usd, 2),
+                "max_entity_open_exposure_usd": self.settings.risk_max_entity_open_exposure_usd,
+                "best_bid": candidate.best_bid,
+                "best_ask": candidate.best_ask,
+                "bid_ask_spread": bid_ask_spread,
+                "max_bid_ask_spread": self.settings.risk_max_bid_ask_spread,
+                "yes_entry_slippage": yes_entry_slippage,
+                "max_yes_entry_slippage": self.settings.risk_max_yes_entry_slippage,
                 "daily_exposure_used_usd": round(daily_exposure_used, 2),
                 "existing_open_position": has_existing_position,
                 "analysis_trade_count": analysis_trade_count,
@@ -210,6 +244,7 @@ class RiskEngine:
             analysis_id=signal.analysis_id,
             news_item_id=analysis.news_item_id,
             market_id=signal.market_id,
+            entity_key=entity_key,
             allow=decision.allow,
             blockers=decision.blockers,
             approved_size_usd=decision.approved_size_usd,
@@ -295,19 +330,61 @@ class RiskEngine:
         *,
         liquidity: float,
         daily_exposure_used_usd: float,
+        entity_key: str | None,
+        entity_open_exposure_used_usd: float,
         size_multiplier: float,
     ) -> float:
         daily_remaining = max(
             self.settings.risk_max_daily_exposure_usd - daily_exposure_used_usd,
             0.0,
         )
+        entity_remaining = (
+            max(
+                self.settings.risk_max_entity_open_exposure_usd - entity_open_exposure_used_usd,
+                0.0,
+            )
+            if entity_key is not None
+            else self.settings.risk_max_trade_size_usd
+        )
         liquidity_cap = liquidity * self.settings.risk_max_liquidity_share
         capped_size = min(
             self.settings.risk_max_trade_size_usd,
             daily_remaining,
+            entity_remaining,
             liquidity_cap,
         )
         return capped_size * size_multiplier
+
+    async def _entity_exposure_context(
+        self,
+        *,
+        current_entity_tokens: set[str],
+    ) -> tuple[int, float]:
+        if not current_entity_tokens:
+            return 0, 0.0
+
+        open_positions = await self.trade_repository.list_open_positions()
+        matched_positions = 0
+        matched_exposure_usd = 0.0
+
+        for position in open_positions:
+            signal = position.signal
+            analysis = signal.analysis if signal is not None else None
+            if analysis is None:
+                continue
+
+            position_entity_tokens = _extract_query_entity_tokens(
+                query_text=analysis.market_query or "",
+                max_tokens=self.settings.risk_anchor_entity_max_tokens,
+            )
+            if not position_entity_tokens:
+                continue
+
+            if current_entity_tokens & position_entity_tokens:
+                matched_positions += 1
+                matched_exposure_usd += float(position.size_usd)
+
+        return matched_positions, matched_exposure_usd
 
 
 def resolve_news_age_limit_minutes(settings: Settings) -> int:
@@ -362,6 +439,11 @@ def evaluate_risk_case(
     edge: float,
     match_score: float,
     existing_open_position: bool,
+    entity_key: str | None = None,
+    entity_open_positions_count: int = 0,
+    entity_open_exposure_used_usd: float = 0.0,
+    bid_ask_spread: float | None = None,
+    yes_entry_slippage: float | None = None,
     daily_exposure_used_usd: float,
     analysis_trade_count: int = 0,
     top_candidate_score_delta: float | None = None,
@@ -411,6 +493,23 @@ def evaluate_risk_case(
             f"match_score_too_low:{match_score:.4f}<{settings.risk_min_match_score:.4f}"
         )
 
+    if (
+        bid_ask_spread is not None
+        and bid_ask_spread > settings.risk_max_bid_ask_spread
+    ):
+        blockers.append(
+            f"spread_too_wide:{bid_ask_spread:.4f}>{settings.risk_max_bid_ask_spread:.4f}"
+        )
+
+    if (
+        yes_entry_slippage is not None
+        and yes_entry_slippage > settings.risk_max_yes_entry_slippage
+    ):
+        blockers.append(
+            "yes_entry_slippage_too_high:"
+            f"{yes_entry_slippage:.4f}>{settings.risk_max_yes_entry_slippage:.4f}"
+        )
+
     anchor_overlap_count, query_anchor_tokens = _query_market_anchor_stats(
         settings=settings,
         query_text=query_text,
@@ -445,6 +544,26 @@ def evaluate_risk_case(
     ):
         blockers.append("duplicate_market_position_exists")
 
+    if (
+        entity_key is not None
+        and entity_open_positions_count >= settings.risk_max_open_positions_per_entity
+    ):
+        blockers.append(
+            "entity_open_position_limit_reached:"
+            f"{entity_key}:{entity_open_positions_count}>="
+            f"{settings.risk_max_open_positions_per_entity}"
+        )
+
+    if (
+        entity_key is not None
+        and entity_open_exposure_used_usd >= settings.risk_max_entity_open_exposure_usd
+    ):
+        blockers.append(
+            "entity_open_exposure_limit_reached:"
+            f"{entity_key}:{entity_open_exposure_used_usd:.2f}>="
+            f"{settings.risk_max_entity_open_exposure_usd:.2f}"
+        )
+
     if analysis_trade_count >= settings.risk_max_trades_per_analysis:
         blockers.append(
             "analysis_trade_limit_reached:"
@@ -473,10 +592,19 @@ def evaluate_risk_case(
             settings.risk_max_daily_exposure_usd - daily_exposure_used_usd,
             0.0,
         )
+        entity_remaining = (
+            max(
+                settings.risk_max_entity_open_exposure_usd - entity_open_exposure_used_usd,
+                0.0,
+            )
+            if entity_key is not None
+            else settings.risk_max_trade_size_usd
+        )
         liquidity_cap = liquidity * settings.risk_max_liquidity_share
         approved_size_usd = min(
             settings.risk_max_trade_size_usd,
             daily_remaining,
+            entity_remaining,
             liquidity_cap,
         )
         approved_size_usd *= approved_size_multiplier
@@ -550,6 +678,60 @@ def _extract_query_anchor_tokens(
     ]
     ranked_tokens = sorted(filtered_tokens, key=lambda token: (-len(token), token))
     return set(ranked_tokens[:max_tokens])
+
+
+def _extract_query_entity_tokens(
+    *,
+    query_text: str,
+    max_tokens: int,
+) -> set[str]:
+    anchor_tokens = _extract_query_anchor_tokens(
+        query_text=query_text,
+        max_tokens=max_tokens,
+    )
+    if anchor_tokens:
+        return anchor_tokens
+
+    query_tokens = _tokenize_overlap_text(query_text)
+    ranked_tokens = sorted(query_tokens, key=lambda token: (-len(token), token))
+    return set(ranked_tokens[:max_tokens])
+
+
+def _build_entity_key(tokens: set[str]) -> str | None:
+    if not tokens:
+        return None
+    return "|".join(sorted(tokens))
+
+
+def _resolve_bid_ask_spread(
+    *,
+    best_bid: float | None,
+    best_ask: float | None,
+) -> float | None:
+    if best_bid is None or best_ask is None:
+        return None
+    if best_ask < best_bid:
+        return None
+    return round(best_ask - best_bid, 4)
+
+
+def _resolve_yes_entry_slippage(
+    *,
+    direction: str,
+    reference_market_price: float,
+    best_ask: float | None,
+) -> float | None:
+    # Safe version:
+    # - apply only to YES-side entries
+    # - use best ask as immediate executable buy price
+    # - leave NO-side token-level slippage as a future TODO behind a CLOB adapter
+    if direction != VerdictDirection.YES.value:
+        return None
+    if best_ask is None:
+        return None
+    if best_ask < reference_market_price:
+        return 0.0
+    return round(best_ask - reference_market_price, 4)
 
 
 async def run_risk_engine(

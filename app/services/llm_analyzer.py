@@ -21,6 +21,7 @@ from app.models.news import NewsItem
 from app.repositories.analysis_repo import AnalysisRepository
 from app.repositories.news_repo import NewsRepository
 from app.schemas.verdict import AnalysisRunResult, Verdict
+from app.services.retry_utils import retry_async
 
 
 logger = logging.getLogger(__name__)
@@ -114,8 +115,8 @@ class OpenAILLMClient:
     async def analyze_news_item(self, news_item: NewsItem) -> tuple[Verdict, dict[str, object] | None]:
         prompt = self._build_user_prompt(news_item)
 
-        try:
-            completion = await self.client.beta.chat.completions.parse(
+        async def _request_once():
+            return await self.client.beta.chat.completions.parse(
                 model=self.settings.openai_model,
                 temperature=self.settings.openai_temperature,
                 max_completion_tokens=self.settings.openai_max_completion_tokens,
@@ -133,6 +134,21 @@ class OpenAILLMClient:
                     {"role": "user", "content": prompt},
                 ],
                 response_format=Verdict,
+            )
+
+        try:
+            completion = await retry_async(
+                _request_once,
+                logger=logger,
+                provider="openai",
+                operation_name="structured_verdict",
+                max_attempts=self.settings.openai_retry_max_attempts,
+                base_delay_seconds=self.settings.openai_retry_base_delay_seconds,
+                is_retryable=_is_retryable_openai_exception,
+                context={
+                    "model": self.settings.openai_model,
+                    "news_item_id": news_item.id,
+                },
             )
         except (APITimeoutError, APIConnectionError, APIStatusError, OpenAIError) as exc:
             request_id = getattr(exc, "request_id", None)
@@ -189,6 +205,17 @@ class OpenAILLMClient:
             f"URL: {news_item.url}\n"
             f"Content: {content}\n"
         )
+
+
+def _is_retryable_openai_exception(exc: Exception) -> bool:
+    if isinstance(exc, (APITimeoutError, APIConnectionError)):
+        return True
+
+    if isinstance(exc, APIStatusError):
+        status_code = getattr(exc, "status_code", None)
+        return status_code == 429 or (status_code is not None and status_code >= 500)
+
+    return False
 
 
 def build_llm_client(settings: Settings) -> LLMClientProtocol:

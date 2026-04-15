@@ -16,6 +16,7 @@ from app.logging_utils import configure_logging, log_event
 from app.models.analysis import Analysis
 from app.repositories.analysis_repo import AnalysisRepository
 from app.schemas.market import GammaMarket, MarketCandidate, MarketMatchResult
+from app.services.retry_utils import retry_async
 
 
 logger = logging.getLogger(__name__)
@@ -214,9 +215,22 @@ class GammaPolymarketClient:
                     params["active"] = "true"
                 params["closed"] = "true" if self.settings.gamma_fetch_closed else "false"
 
-                try:
+                async def _request_once() -> httpx.Response:
                     response = await client.get(base_url, params=params)
                     response.raise_for_status()
+                    return response
+
+                try:
+                    response = await retry_async(
+                        _request_once,
+                        logger=logger,
+                        provider="polymarket_gamma",
+                        operation_name="fetch_markets_page",
+                        max_attempts=self.settings.gamma_retry_max_attempts,
+                        base_delay_seconds=self.settings.gamma_retry_base_delay_seconds,
+                        is_retryable=_is_retryable_gamma_exception,
+                        context={"offset": offset},
+                    )
                 except httpx.HTTPError as exc:
                     log_event(
                         logger,
@@ -251,6 +265,14 @@ class GammaPolymarketClient:
         market = GammaMarket.model_validate(payload)
         market.raw_payload = payload
         return market
+
+
+def _is_retryable_gamma_exception(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code == 429 or 500 <= status_code <= 599
+
+    return isinstance(exc, httpx.TransportError)
 
 
 class MarketRankerProtocol(Protocol):

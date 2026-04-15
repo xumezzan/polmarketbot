@@ -1,10 +1,12 @@
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from app.schemas.verdict import Verdict
 from app.services.llm_analyzer import OpenAILLMClient
 from app.services.market_client import GammaPolymarketClient
+from app.services.news_fetcher import NewsApiClient
 from tests.helpers import build_test_settings
 
 
@@ -143,3 +145,178 @@ async def test_gamma_market_client_parses_mocked_api_response(monkeypatch: pytes
         "active": "true",
         "closed": "false",
     }
+
+
+@pytest.mark.asyncio
+async def test_news_api_client_retries_rate_limit_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_log: list[dict[str, object]] = []
+    article_payload = {
+        "status": "ok",
+        "totalResults": 1,
+        "articles": [
+            {
+                "source": {"id": "stub-1", "name": "Stub Crypto Wire"},
+                "author": "Bot Tester",
+                "title": "Bitcoin jumps on ETF optimism",
+                "description": "Short summary",
+                "url": "https://example.com/bitcoin-etf",
+                "publishedAt": "2026-04-15T09:00:00Z",
+                "content": "Bitcoin jumped after ETF optimism returned.",
+            }
+        ],
+    }
+
+    class FakeResponse:
+        def __init__(self, payload, status_code: int = 200, url: str = "https://example.com") -> None:
+            self.payload = payload
+            self.status_code = status_code
+            self._url = url
+            self.text = '{"status":"error","code":"rateLimited"}' if status_code == 429 else ""
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("GET", self._url)
+                response = httpx.Response(self.status_code, request=request, text=self.text)
+                raise httpx.HTTPStatusError(
+                    f"status={self.status_code}",
+                    request=request,
+                    response=response,
+                )
+
+        def json(self):
+            return self.payload
+
+    class FakeAsyncClient:
+        calls = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url: str, params: dict[str, object] | None = None, headers=None):
+            request_log.append({"url": url, "params": params or {}, "headers": headers or {}})
+            FakeAsyncClient.calls += 1
+            if FakeAsyncClient.calls == 1:
+                return FakeResponse({}, status_code=429, url=url)
+            return FakeResponse(article_payload, status_code=200, url=url)
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("app.services.news_fetcher.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.services.news_fetcher.asyncio.sleep", fake_sleep)
+    client = NewsApiClient(
+        build_test_settings(
+            news_fetch_mode="newsapi",
+            news_api_key="test-news-key",
+            news_retry_max_attempts=2,
+            news_retry_base_delay_seconds=0,
+        )
+    )
+    articles = await client.fetch_latest()
+
+    assert len(articles) == 1
+    assert articles[0].title == "Bitcoin jumps on ETF optimism"
+    assert len(request_log) == 2
+
+
+@pytest.mark.asyncio
+async def test_gamma_market_client_retries_rate_limit_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_log: list[dict[str, object]] = []
+    market_payload = [
+        {
+            "id": "stub-btc-100k",
+            "question": "Will Bitcoin reach $100,000 by December 31, 2026?",
+            "slug": "bitcoin-100k-by-end-of-2026",
+            "conditionId": "cond-btc-100k",
+            "liquidity": "245000.5",
+            "volume": "925000.2",
+            "bestBid": 0.58,
+            "bestAsk": 0.60,
+            "lastTradePrice": 0.59,
+            "active": True,
+            "closed": False,
+            "archived": False,
+            "enableOrderBook": True,
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.59\", \"0.41\"]",
+            "clobTokenIds": "[\"btc100k-yes\", \"btc100k-no\"]",
+            "events": [
+                {
+                    "id": "event-btc-price",
+                    "slug": "bitcoin-price-targets",
+                    "title": "Bitcoin price targets",
+                }
+            ],
+        }
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload, status_code: int = 200, url: str = "https://example.com") -> None:
+            self.payload = payload
+            self.status_code = status_code
+            self._url = url
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("GET", self._url)
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError(
+                    f"status={self.status_code}",
+                    request=request,
+                    response=response,
+                )
+
+        def json(self):
+            return self.payload
+
+    class FakeAsyncClient:
+        calls = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url: str, params: dict[str, object] | None = None):
+            request_log.append({"url": url, "params": params or {}})
+            FakeAsyncClient.calls += 1
+            if FakeAsyncClient.calls == 1:
+                return FakeResponse({}, status_code=429, url=url)
+            if FakeAsyncClient.calls == 2:
+                return FakeResponse(market_payload, status_code=200, url=url)
+            return FakeResponse([], status_code=200, url=url)
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("app.services.market_client.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.services.market_client.asyncio.sleep", fake_sleep)
+
+    client = GammaPolymarketClient(
+        build_test_settings(
+            market_fetch_mode="gamma",
+            gamma_markets_page_size=1,
+            gamma_markets_max_pages=2,
+            gamma_retry_max_attempts=2,
+            gamma_retry_base_delay_seconds=0,
+        )
+    )
+    markets = await client.fetch_markets()
+
+    assert len(markets) == 1
+    assert markets[0].id == "stub-btc-100k"
+    assert len(request_log) == 3
