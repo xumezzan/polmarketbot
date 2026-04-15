@@ -7,6 +7,7 @@ from app.database import AsyncSessionLocal
 from app.logging_utils import configure_logging
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
+from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.trade_repo import TradeRepository
 from app.services.monitor import MonitorService
 
@@ -19,6 +20,7 @@ async def _main() -> None:
         monitor = MonitorService(
             settings=settings,
             operator_state_repository=OperatorStateRepository(session),
+            scheduler_cycle_repository=SchedulerCycleRepository(session),
             news_repository=NewsRepository(session),
             trade_repository=TradeRepository(session),
         )

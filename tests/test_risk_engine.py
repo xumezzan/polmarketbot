@@ -305,6 +305,169 @@ def test_risk_engine_blocks_second_trade_for_same_analysis() -> None:
     assert "analysis_trade_limit_reached:1>=1" in result.blockers
 
 
+def test_risk_engine_blocks_entity_open_position_limit() -> None:
+    settings = build_test_settings(
+        risk_max_open_positions_per_entity=1,
+        risk_max_entity_open_exposure_usd=50.0,
+    )
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.08,
+        match_score=0.42,
+        existing_open_position=False,
+        entity_key="bitcoin",
+        entity_open_positions_count=1,
+        entity_open_exposure_used_usd=25.0,
+        daily_exposure_used_usd=0.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is False
+    assert "entity_open_position_limit_reached:bitcoin:1>=1" in result.blockers
+
+
+def test_risk_engine_blocks_entity_open_exposure_limit() -> None:
+    settings = build_test_settings(
+        risk_max_open_positions_per_entity=2,
+        risk_max_entity_open_exposure_usd=50.0,
+    )
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.08,
+        match_score=0.42,
+        existing_open_position=False,
+        entity_key="bitcoin",
+        entity_open_positions_count=1,
+        entity_open_exposure_used_usd=50.0,
+        daily_exposure_used_usd=0.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is False
+    assert "entity_open_exposure_limit_reached:bitcoin:50.00>=50.00" in result.blockers
+
+
+def test_risk_engine_caps_approved_size_by_entity_remaining_exposure() -> None:
+    settings = build_test_settings(
+        risk_max_open_positions_per_entity=2,
+        risk_max_entity_open_exposure_usd=30.0,
+        risk_max_trade_size_usd=50.0,
+    )
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.08,
+        match_score=0.42,
+        existing_open_position=False,
+        entity_key="bitcoin",
+        entity_open_positions_count=0,
+        entity_open_exposure_used_usd=12.0,
+        daily_exposure_used_usd=0.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is True
+    assert result.approved_size_usd == 18.0
+
+
+def test_risk_engine_blocks_wide_bid_ask_spread() -> None:
+    settings = build_test_settings(
+        risk_max_bid_ask_spread=0.03,
+    )
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.08,
+        match_score=0.42,
+        existing_open_position=False,
+        bid_ask_spread=0.05,
+        daily_exposure_used_usd=0.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is False
+    assert "spread_too_wide:0.0500>0.0300" in result.blockers
+
+
+def test_risk_engine_blocks_yes_entry_slippage() -> None:
+    settings = build_test_settings(
+        risk_max_bid_ask_spread=0.03,
+        risk_max_yes_entry_slippage=0.02,
+    )
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.08,
+        match_score=0.42,
+        existing_open_position=False,
+        bid_ask_spread=0.01,
+        yes_entry_slippage=0.03,
+        daily_exposure_used_usd=0.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is False
+    assert "yes_entry_slippage_too_high:0.0300>0.0200" in result.blockers
+
+
+def test_risk_engine_allows_no_side_without_yes_slippage_check() -> None:
+    settings = build_test_settings(
+        risk_max_bid_ask_spread=0.03,
+        risk_max_yes_entry_slippage=0.02,
+    )
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.08,
+        match_score=0.42,
+        existing_open_position=False,
+        bid_ask_spread=0.01,
+        yes_entry_slippage=None,
+        daily_exposure_used_usd=0.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is True
+
+
 def test_risk_engine_blocks_ambiguous_top_candidates() -> None:
     settings = build_test_settings(
         risk_min_query_market_token_overlap=2,

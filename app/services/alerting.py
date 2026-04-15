@@ -15,6 +15,7 @@ from app.schemas.trade import PaperTradeCloseResult, PaperTradeOpenResult
 
 
 logger = logging.getLogger(__name__)
+_ALERT_RUNTIME_WARNINGS_LOGGED: set[tuple[str, str]] = set()
 
 
 class AlertingError(Exception):
@@ -37,6 +38,24 @@ class NoopAlertClient:
             mode="noop",
             delivered=False,
             error="alert_mode=noop",
+        )
+
+
+class DisabledAlertClient:
+    """Quiet fallback used when alerting is disabled or misconfigured."""
+
+    quiet_skip = True
+
+    def __init__(self, *, mode: str, reason: str) -> None:
+        self.mode = mode
+        self.reason = reason
+
+    async def send(self, alert: AlertMessage) -> AlertDispatchResult:
+        return AlertDispatchResult(
+            event=alert.event,
+            mode=self.mode,
+            delivered=False,
+            error=self.reason,
         )
 
 
@@ -252,6 +271,26 @@ class AlertingService:
             if report.top_blockers
             else ["- none"]
         )
+        provider_failure_lines = (
+            [
+                f"- {html.escape(item.provider)}: <code>{item.count}</code>"
+                for item in report.provider_failures
+            ]
+            if report.provider_failures
+            else ["- none"]
+        )
+        provider_cooldown_lines = (
+            [
+                (
+                    f"- {html.escape(item.provider)}: "
+                    f"<code>{item.remaining_seconds}s</code> "
+                    f"(until <code>{html.escape(item.cooldown_until)}</code>)"
+                )
+                for item in report.provider_cooldowns
+            ]
+            if report.provider_cooldowns
+            else ["- none"]
+        )
         note_lines = (
             [f"- {html.escape(note)}" for note in report.notes]
             if report.notes
@@ -269,20 +308,32 @@ class AlertingService:
                     f"window_start=<code>{html.escape(report.window_start)}</code>",
                     f"window_end=<code>{html.escape(report.window_end)}</code>",
                     "",
+                    f"scheduler_cycles=<code>{report.scheduler_cycles_24h}</code>",
+                    f"failed_cycles=<code>{report.failed_cycles_24h}</code>",
+                    f"consecutive_failed_cycles=<code>{report.consecutive_failed_cycles}</code>",
+                    f"consecutive_idle_cycles=<code>{report.consecutive_idle_cycles}</code>",
                     f"fetched_news=<code>{fetched_text}</code>",
                     f"inserted_news=<code>{report.inserted_news_24h}</code>",
                     f"analyses=<code>{report.analyses_count_24h}</code>",
                     f"signals=<code>{report.signals_count_24h}</code>",
+                    f"actionable_signals=<code>{report.actionable_signals_count_24h}</code>",
                     f"approved_signals=<code>{report.approved_signals_count_24h}</code>",
                     f"opened_trades=<code>{report.opened_paper_trades_24h}</code>",
                     f"closed_trades=<code>{report.closed_paper_trades_24h}</code>",
                     f"open_positions=<code>{report.open_positions_count}</code>",
+                    f"last_successful_cycle=<code>{html.escape(report.last_successful_cycle_at or 'n/a')}</code>",
                     f"realized_pnl=<code>{report.realized_pnl_24h:.4f}</code>",
                     (
                         "unrealized_pnl="
                         f"<code>{unrealized_text}</code> "
                         f"(valued={report.unrealized_positions_valued}/{report.unrealized_positions_total})"
                     ),
+                    "",
+                    "<b>Provider failures</b>",
+                    *provider_failure_lines,
+                    "",
+                    "<b>Provider cooldowns</b>",
+                    *provider_cooldown_lines,
                     "",
                     "<b>Top blockers</b>",
                     *blocker_lines,
@@ -293,9 +344,14 @@ class AlertingService:
             ),
             context={
                 "generated_at": report.generated_at,
+                "scheduler_cycles_24h": report.scheduler_cycles_24h,
+                "failed_cycles_24h": report.failed_cycles_24h,
+                "consecutive_failed_cycles": report.consecutive_failed_cycles,
+                "consecutive_idle_cycles": report.consecutive_idle_cycles,
                 "inserted_news_24h": report.inserted_news_24h,
                 "analyses_count_24h": report.analyses_count_24h,
                 "signals_count_24h": report.signals_count_24h,
+                "actionable_signals_count_24h": report.actionable_signals_count_24h,
                 "approved_signals_count_24h": report.approved_signals_count_24h,
                 "opened_paper_trades_24h": report.opened_paper_trades_24h,
                 "closed_paper_trades_24h": report.closed_paper_trades_24h,
@@ -434,6 +490,9 @@ class AlertingService:
                 error=str(exc),
             )
 
+        if not result.delivered and getattr(self.client, "quiet_skip", False):
+            return result
+
         log_event(
             logger,
             "alert_delivery_completed",
@@ -472,9 +531,105 @@ def build_alert_client(settings: Settings) -> AlertClientProtocol:
         return NoopAlertClient()
 
     if mode == "telegram":
+        reason = validate_alerting_configuration(settings)
+        if reason is not None:
+            _log_alert_runtime_warning_once(mode=mode, reason=reason)
+            return DisabledAlertClient(mode=mode, reason=reason)
         return TelegramAlertClient(settings)
 
-    raise ValueError("Unsupported ALERT_MODE. Expected 'noop' or 'telegram'.")
+    reason = f"unsupported_alert_mode:{mode}"
+    _log_alert_runtime_warning_once(mode=mode, reason=reason)
+    return DisabledAlertClient(mode=mode, reason=reason)
+
+
+def get_alerting_runtime_status(settings: Settings) -> dict[str, str | bool]:
+    """Return current alerting readiness without performing network I/O."""
+    mode = settings.alert_mode.lower()
+
+    if mode == "noop":
+        return {
+            "mode": mode,
+            "enabled": False,
+            "status": "noop",
+            "reason": "alert_mode=noop",
+        }
+
+    reason = validate_alerting_configuration(settings)
+    if reason is not None:
+        status = "disabled" if reason == "telegram_enabled=false" else "misconfigured"
+        return {
+            "mode": mode,
+            "enabled": False,
+            "status": status,
+            "reason": reason,
+        }
+
+    if mode == "telegram":
+        return {
+            "mode": mode,
+            "enabled": True,
+            "status": "ready",
+            "reason": "",
+        }
+
+    return {
+        "mode": mode,
+        "enabled": False,
+        "status": "misconfigured",
+        "reason": f"unsupported_alert_mode:{mode}",
+    }
+
+
+def validate_alerting_configuration(settings: Settings) -> str | None:
+    """Return a short machine-readable reason when alerting is not usable."""
+    mode = settings.alert_mode.lower()
+    if mode == "noop":
+        return None
+
+    if mode != "telegram":
+        return f"unsupported_alert_mode:{mode}"
+
+    if not settings.telegram_enabled:
+        return "telegram_enabled=false"
+
+    bot_token = settings.telegram_bot_token.strip()
+    if not bot_token:
+        return "telegram_bot_token_missing"
+    if _looks_like_placeholder(bot_token):
+        return "telegram_bot_token_placeholder"
+
+    chat_id = settings.telegram_chat_id.strip()
+    if not chat_id:
+        return "telegram_chat_id_missing"
+    if _looks_like_placeholder(chat_id):
+        return "telegram_chat_id_placeholder"
+
+    return None
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return False
+
+    if normalized == "...":
+        return True
+
+    return normalized.startswith("<") and normalized.endswith(">")
+
+
+def _log_alert_runtime_warning_once(*, mode: str, reason: str) -> None:
+    cache_key = (mode, reason)
+    if cache_key in _ALERT_RUNTIME_WARNINGS_LOGGED:
+        return
+
+    _ALERT_RUNTIME_WARNINGS_LOGGED.add(cache_key)
+    log_event(
+        logger,
+        "alert_client_disabled",
+        mode=mode,
+        reason=reason,
+    )
 
 
 def _parse_args() -> argparse.Namespace:

@@ -1,10 +1,12 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from app.config import Settings
 from app.repositories.analysis_repo import AnalysisRepository
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
 from app.repositories.runtime_flag_repo import RuntimeFlagRepository
+from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
 from app.runtime_flags import RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH
@@ -35,19 +37,23 @@ class OperatorService:
     def __init__(
         self,
         *,
+        settings: Settings,
         news_repository: NewsRepository,
         analysis_repository: AnalysisRepository,
         signal_repository: SignalRepository,
         trade_repository: TradeRepository,
         runtime_flag_repository: RuntimeFlagRepository,
         operator_state_repository: OperatorStateRepository,
+        scheduler_cycle_repository: SchedulerCycleRepository,
     ) -> None:
+        self.settings = settings
         self.news_repository = news_repository
         self.analysis_repository = analysis_repository
         self.signal_repository = signal_repository
         self.trade_repository = trade_repository
         self.runtime_flag_repository = runtime_flag_repository
         self.operator_state_repository = operator_state_repository
+        self.scheduler_cycle_repository = scheduler_cycle_repository
 
     async def get_status(self) -> AdminStatusResponse:
         now = datetime.now(UTC)
@@ -60,6 +66,13 @@ class OperatorService:
         )
 
         news_items_count = await self.news_repository.count()
+        fetched_news_24h = await self.scheduler_cycle_repository.sum_fetched_news_since(since=since)
+        scheduler_cycles_24h = await self.scheduler_cycle_repository.count_cycles_since(since=since)
+        failed_cycles_24h = await self.scheduler_cycle_repository.count_failed_cycles_since(since=since)
+        provider_cooldowns = await self.scheduler_cycle_repository.get_active_provider_cooldowns(
+            now=now,
+            newsapi_cooldown_minutes=self.settings.news_rate_limit_cooldown_minutes,
+        )
         inserted_news_24h = await self.news_repository.count_created_since(since=since)
         analyses_count = await self.analysis_repository.count()
         analyses_count_24h = await self.analysis_repository.count_created_since(since=since)
@@ -85,6 +98,17 @@ class OperatorService:
             paper_trades_count=paper_trades_count,
             open_positions_count=open_positions_count,
             kill_switch_enabled=kill_switch_enabled,
+            fetched_news_24h=fetched_news_24h,
+            scheduler_cycles_24h=scheduler_cycles_24h,
+            failed_cycles_24h=failed_cycles_24h,
+            provider_cooldowns={
+                provider: {
+                    "cooldown_until": cooldown_until.isoformat(),
+                    "remaining_seconds": remaining_seconds,
+                    "reason": reason,
+                }
+                for provider, cooldown_until, remaining_seconds, reason in provider_cooldowns
+            },
             inserted_news_24h=inserted_news_24h,
             analyses_count_24h=analyses_count_24h,
             signals_count_24h=signals_count_24h,

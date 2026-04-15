@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
+from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.trade_repo import TradeRepository
 from app.schemas.monitor import SystemVerificationReport, VerificationLayer
 
@@ -22,11 +23,13 @@ class MonitorService:
         *,
         settings: Settings,
         operator_state_repository: OperatorStateRepository,
+        scheduler_cycle_repository: SchedulerCycleRepository,
         news_repository: NewsRepository,
         trade_repository: TradeRepository,
     ) -> None:
         self.settings = settings
         self.operator_state_repository = operator_state_repository
+        self.scheduler_cycle_repository = scheduler_cycle_repository
         self.news_repository = news_repository
         self.trade_repository = trade_repository
 
@@ -86,16 +89,36 @@ class MonitorService:
     async def verify_layer_b_pipeline(self) -> VerificationLayer:
         """Layer B: Pipeline is alive (Scheduler check)."""
         state = await self.operator_state_repository.get()
-        if not state or not state.last_cycle_finished_at:
+        now = datetime.now(UTC)
+        since_24h = now - timedelta(hours=24)
+        consecutive_failed_cycles = await self.scheduler_cycle_repository.count_consecutive_failed_cycles()
+        consecutive_idle_cycles = await self.scheduler_cycle_repository.count_consecutive_idle_cycles()
+        failed_cycles_24h = await self.scheduler_cycle_repository.count_failed_cycles_since(
+            since=since_24h
+        )
+        latest_finished_cycle = await self.scheduler_cycle_repository.get_latest_finished()
+        latest_successful_cycle = await self.scheduler_cycle_repository.get_latest_completed()
+        provider_failures = await self.scheduler_cycle_repository.get_provider_failure_counts_since(
+            since=since_24h,
+            limit=3,
+        )
+        provider_cooldowns = await self.scheduler_cycle_repository.get_active_provider_cooldowns(
+            now=now,
+            newsapi_cooldown_minutes=self.settings.news_rate_limit_cooldown_minutes,
+        )
+        if (not state or not state.last_cycle_finished_at) and latest_finished_cycle is None:
             return VerificationLayer(
                 status="warning",
                 message="No cycle history found in operator_state.",
-                details={}
+                details={
+                    "consecutive_failed_cycles": consecutive_failed_cycles,
+                    "consecutive_idle_cycles": consecutive_idle_cycles,
+                    "failed_cycles_24h": failed_cycles_24h,
+                },
             )
 
-        now = datetime.now(UTC)
         # Use simple UTC objects to avoid offset issues
-        last_cycle = state.last_cycle_finished_at
+        last_cycle = state.last_cycle_finished_at if state and state.last_cycle_finished_at else latest_finished_cycle.finished_at
         if last_cycle.tzinfo is None:
             last_cycle = last_cycle.replace(tzinfo=UTC)
 
@@ -106,7 +129,24 @@ class MonitorService:
         details = {
             "last_cycle_finished_at": last_cycle.isoformat(),
             "seconds_since_last_cycle": delta.total_seconds(),
-            "scheduler_interval_minutes": self.settings.scheduler_interval_minutes
+            "scheduler_interval_minutes": self.settings.scheduler_interval_minutes,
+            "failed_cycles_24h": failed_cycles_24h,
+            "consecutive_failed_cycles": consecutive_failed_cycles,
+            "consecutive_idle_cycles": consecutive_idle_cycles,
+            "last_successful_cycle_at": (
+                latest_successful_cycle.finished_at.isoformat()
+                if latest_successful_cycle is not None and latest_successful_cycle.finished_at is not None
+                else None
+            ),
+            "provider_failures_24h": {provider: count for provider, count in provider_failures},
+            "provider_cooldowns": {
+                provider: {
+                    "cooldown_until": cooldown_until.isoformat(),
+                    "remaining_seconds": remaining_seconds,
+                    "reason": reason,
+                }
+                for provider, cooldown_until, remaining_seconds, reason in provider_cooldowns
+            },
         }
 
         if delta.total_seconds() > interval_sec * 4:
@@ -121,6 +161,31 @@ class MonitorService:
                 message=f"Pipeline lagging: last cycle was {delta.total_seconds()/60:.1f}m ago",
                 details=details
             )
+
+        if provider_cooldowns:
+            cooldown_summary = ", ".join(
+                f"{provider}({remaining_seconds}s)"
+                for provider, _cooldown_until, remaining_seconds, _reason in provider_cooldowns
+            )
+            return VerificationLayer(
+                status="warning",
+                message=f"Pipeline active, but provider cooldown is active: {cooldown_summary}",
+                details=details,
+            )
+
+        if consecutive_failed_cycles >= 3:
+            return VerificationLayer(
+                status="error",
+                message=f"Pipeline failing repeatedly: {consecutive_failed_cycles} failed cycles in a row",
+                details=details,
+            )
+
+        if consecutive_failed_cycles > 0:
+            return VerificationLayer(
+                status="warning",
+                message=f"Latest cycle failed; consecutive_failed_cycles={consecutive_failed_cycles}",
+                details=details,
+            )
         
         return VerificationLayer(status="ok", message="Pipeline is active", details=details)
 
@@ -130,17 +195,59 @@ class MonitorService:
         since_24h = now - timedelta(hours=24)
         
         news_count = await self.news_repository.count_created_since(since=since_24h)
+        consecutive_idle_cycles = await self.scheduler_cycle_repository.count_consecutive_idle_cycles()
+        failed_cycles_24h = await self.scheduler_cycle_repository.count_failed_cycles_since(
+            since=since_24h
+        )
+        provider_failures = await self.scheduler_cycle_repository.get_provider_failure_counts_since(
+            since=since_24h,
+            limit=3,
+        )
+        provider_cooldowns = await self.scheduler_cycle_repository.get_active_provider_cooldowns(
+            now=now,
+            newsapi_cooldown_minutes=self.settings.news_rate_limit_cooldown_minutes,
+        )
         
         details = {
             "news_saved_last_24h": news_count,
-            "lookback_hours": 24
+            "lookback_hours": 24,
+            "consecutive_idle_cycles": consecutive_idle_cycles,
+            "failed_cycles_24h": failed_cycles_24h,
+            "provider_failures_24h": {provider: count for provider, count in provider_failures},
+            "provider_cooldowns": {
+                provider: {
+                    "cooldown_until": cooldown_until.isoformat(),
+                    "remaining_seconds": remaining_seconds,
+                    "reason": reason,
+                }
+                for provider, cooldown_until, remaining_seconds, reason in provider_cooldowns
+            },
         }
 
         if news_count == 0:
+            if provider_cooldowns:
+                return VerificationLayer(
+                    status="warning",
+                    message="No new news items in 24h and provider cooldown is active.",
+                    details=details
+                )
+            if failed_cycles_24h > 0:
+                return VerificationLayer(
+                    status="warning",
+                    message="No new news items in 24h and provider failures were detected.",
+                    details=details
+                )
             return VerificationLayer(
                 status="warning",
                 message="No new news items saved in the last 24 hours.",
                 details=details
+            )
+
+        if consecutive_idle_cycles >= 3:
+            return VerificationLayer(
+                status="warning",
+                message=f"Data flow is idle: {consecutive_idle_cycles} consecutive idle cycles.",
+                details=details,
             )
             
         return VerificationLayer(
