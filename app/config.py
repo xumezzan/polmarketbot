@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     risk_extended_news_age_size_multiplier: float = 0.5
     risk_min_market_liquidity: float = 10000.0
     risk_priced_in_edge_threshold: float = 0.03
+    risk_min_match_score: float = 0.35
+    risk_min_query_market_token_overlap: int = 2
+    risk_min_query_market_overlap_token_length: int = 5
+    risk_min_anchor_entity_overlap: int = 1
+    risk_anchor_entity_max_tokens: int = 2
+    risk_max_trades_per_analysis: int = 1
+    risk_min_top_candidate_score_delta: float = 0.05
     risk_max_daily_exposure_usd: float = 250.0
     risk_max_trade_size_usd: float = 50.0
     risk_max_liquidity_share: float = 0.02

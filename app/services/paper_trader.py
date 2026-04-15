@@ -380,6 +380,25 @@ class PaperTrader:
         if analysis is None or analysis.news_item is None:
             raise PaperTraderError("Signal is missing linked analysis/news context.")
 
+        analysis_trade_count = await self.trade_repository.count_trades_for_analysis(
+            analysis_id=analysis.id
+        )
+        if analysis_trade_count >= self.settings.risk_max_trades_per_analysis:
+            log_event(
+                logger,
+                "paper_trade_open_blocked_analysis_trade_limit",
+                signal_id=signal.id,
+                analysis_id=analysis.id,
+                news_item_id=analysis.news_item_id,
+                market_id=signal.market_id,
+                analysis_trade_count=analysis_trade_count,
+                max_trades_per_analysis=self.settings.risk_max_trades_per_analysis,
+            )
+            raise PaperTraderError(
+                "analysis_trade_limit_reached:"
+                f"{analysis_trade_count}>={self.settings.risk_max_trades_per_analysis}"
+            )
+
         side = self._select_side(direction=analysis.direction)
         entry_price = float(signal.market_price)
         if entry_price <= 0:

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import re
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +19,48 @@ from app.schemas.risk import RiskCheckResult, RiskDecision
 
 
 logger = logging.getLogger(__name__)
+
+OVERLAP_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "this",
+    "to",
+    "will",
+}
+
+ANCHOR_GENERIC_TOKENS = {
+    "price",
+    "prediction",
+    "outcome",
+    "election",
+    "presidential",
+    "governor",
+    "resign",
+    "ceasefire",
+    "performance",
+    "impact",
+    "news",
+    "update",
+    "market",
+    "markets",
+    "purchase",
+    "adoption",
+    "activity",
+    "sales",
+    "transfer",
+}
 
 
 class RiskEngineError(Exception):
@@ -61,6 +104,12 @@ class RiskEngine:
         has_existing_position = await self.trade_repository.has_open_position_for_market(
             market_id=signal.market_id
         )
+        analysis_trade_count = await self.trade_repository.count_trades_for_analysis(
+            analysis_id=signal.analysis_id
+        )
+        top_match_score, second_match_score, top_candidate_score_delta = (
+            self._load_market_match_score_context(signal)
+        )
 
         risk_result = evaluate_risk_case(
             settings=self.settings,
@@ -70,8 +119,23 @@ class RiskEngine:
             news_age_minutes=news_age_minutes,
             liquidity=liquidity,
             edge=float(signal.edge),
+            match_score=float(candidate.match_score),
+            query_text=analysis.market_query or "",
+            market_question=candidate.question,
             existing_open_position=has_existing_position,
+            analysis_trade_count=analysis_trade_count,
             daily_exposure_used_usd=daily_exposure_used,
+            top_candidate_score_delta=top_candidate_score_delta,
+        )
+
+        overlap_count, max_overlap_token_length = _query_market_overlap_stats(
+            query_text=analysis.market_query or "",
+            market_question=candidate.question,
+        )
+        anchor_overlap_count, query_anchor_tokens = _query_market_anchor_stats(
+            settings=self.settings,
+            query_text=analysis.market_query or "",
+            market_question=candidate.question,
         )
 
         approved_size_usd = 0.0
@@ -112,8 +176,23 @@ class RiskEngine:
                 "used_extended_news_age_window": used_extended_news_age_window,
                 "news_age_size_multiplier": approved_size_multiplier,
                 "liquidity": liquidity,
+                "match_score": float(candidate.match_score),
+                "min_match_score": self.settings.risk_min_match_score,
+                "query_market_overlap_count": overlap_count,
+                "min_query_market_overlap_count": self.settings.risk_min_query_market_token_overlap,
+                "max_overlap_token_length": max_overlap_token_length,
+                "min_overlap_token_length": self.settings.risk_min_query_market_overlap_token_length,
+                "query_anchor_tokens": ",".join(sorted(query_anchor_tokens)) or None,
+                "anchor_overlap_count": anchor_overlap_count,
+                "min_anchor_overlap_count": self.settings.risk_min_anchor_entity_overlap,
                 "daily_exposure_used_usd": round(daily_exposure_used, 2),
                 "existing_open_position": has_existing_position,
+                "analysis_trade_count": analysis_trade_count,
+                "max_trades_per_analysis": self.settings.risk_max_trades_per_analysis,
+                "top_match_score": top_match_score,
+                "second_match_score": second_match_score,
+                "top_candidate_score_delta": top_candidate_score_delta,
+                "min_top_candidate_score_delta": self.settings.risk_min_top_candidate_score_delta,
                 "priced_in_threshold": self.settings.risk_priced_in_edge_threshold,
             },
             evaluated_at=now.isoformat(),
@@ -177,6 +256,39 @@ class RiskEngine:
 
         age_seconds = max((now - published).total_seconds(), 0.0)
         return int(age_seconds // 60)
+
+    def _load_market_match_score_context(
+        self,
+        signal: Signal,
+    ) -> tuple[float | None, float | None, float | None]:
+        analysis = signal.analysis
+        raw_response = analysis.raw_response or {}
+        snapshots = raw_response.get("snapshots") or {}
+        market_snapshot = snapshots.get("market_matching") or {}
+        raw_candidates = market_snapshot.get("candidates") or []
+
+        scored_candidates = sorted(
+            (
+                float(item.get("match_score"))
+                for item in raw_candidates
+                if item.get("match_score") is not None
+            ),
+            reverse=True,
+        )
+
+        if not scored_candidates:
+            return None, None, None
+
+        top_match_score = scored_candidates[0]
+        if len(scored_candidates) < 2:
+            return top_match_score, None, None
+
+        second_match_score = scored_candidates[1]
+        return (
+            top_match_score,
+            second_match_score,
+            round(top_match_score - second_match_score, 6),
+        )
 
     def _approved_size_usd(
         self,
@@ -248,8 +360,13 @@ def evaluate_risk_case(
     news_age_minutes: int,
     liquidity: float,
     edge: float,
+    match_score: float,
     existing_open_position: bool,
     daily_exposure_used_usd: float,
+    analysis_trade_count: int = 0,
+    top_candidate_score_delta: float | None = None,
+    query_text: str = "",
+    market_question: str = "",
 ) -> RiskCheckResult:
     """
     Pure deterministic helper for local verification and unit tests.
@@ -289,11 +406,59 @@ def evaluate_risk_case(
             f"priced_in_or_converged:{edge:.4f}<={settings.risk_priced_in_edge_threshold:.4f}"
         )
 
+    if match_score < settings.risk_min_match_score:
+        blockers.append(
+            f"match_score_too_low:{match_score:.4f}<{settings.risk_min_match_score:.4f}"
+        )
+
+    anchor_overlap_count, query_anchor_tokens = _query_market_anchor_stats(
+        settings=settings,
+        query_text=query_text,
+        market_question=market_question,
+    )
+    overlap_count, max_overlap_token_length = _query_market_overlap_stats(
+        query_text=query_text,
+        market_question=market_question,
+    )
+    if (
+        not _has_sufficient_query_market_overlap(
+            settings=settings,
+            overlap_count=overlap_count,
+            max_overlap_token_length=max_overlap_token_length,
+        )
+        and anchor_overlap_count <= 0
+    ):
+        blockers.append(
+            "query_market_overlap_too_low:"
+            f"count={overlap_count},max_len={max_overlap_token_length}"
+        )
+
+    if query_anchor_tokens and anchor_overlap_count < settings.risk_min_anchor_entity_overlap:
+        blockers.append(
+            "anchor_entity_overlap_too_low:"
+            f"anchors={','.join(sorted(query_anchor_tokens))},count={anchor_overlap_count}"
+        )
+
     if (
         settings.risk_block_on_existing_position
         and existing_open_position
     ):
         blockers.append("duplicate_market_position_exists")
+
+    if analysis_trade_count >= settings.risk_max_trades_per_analysis:
+        blockers.append(
+            "analysis_trade_limit_reached:"
+            f"{analysis_trade_count}>={settings.risk_max_trades_per_analysis}"
+        )
+
+    if (
+        top_candidate_score_delta is not None
+        and top_candidate_score_delta < settings.risk_min_top_candidate_score_delta
+    ):
+        blockers.append(
+            "ambiguous_market_match:"
+            f"{top_candidate_score_delta:.4f}<{settings.risk_min_top_candidate_score_delta:.4f}"
+        )
 
     if daily_exposure_used_usd >= settings.risk_max_daily_exposure_usd:
         blockers.append(
@@ -324,6 +489,67 @@ def evaluate_risk_case(
         blockers=blockers,
         approved_size_usd=round(approved_size_usd, 2),
     )
+
+
+def _query_market_overlap_stats(
+    *,
+    query_text: str,
+    market_question: str,
+) -> tuple[int, int]:
+    query_tokens = _tokenize_overlap_text(query_text)
+    market_tokens = _tokenize_overlap_text(market_question)
+    overlap_tokens = query_tokens & market_tokens
+    if not overlap_tokens:
+        return 0, 0
+    return len(overlap_tokens), max(len(token) for token in overlap_tokens)
+
+
+def _has_sufficient_query_market_overlap(
+    *,
+    settings: Settings,
+    overlap_count: int,
+    max_overlap_token_length: int,
+) -> bool:
+    return (
+        overlap_count >= settings.risk_min_query_market_token_overlap
+        or max_overlap_token_length >= settings.risk_min_query_market_overlap_token_length
+    )
+
+
+def _tokenize_overlap_text(value: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", value.lower())
+    return {token for token in tokens if token not in OVERLAP_STOPWORDS and len(token) > 1}
+
+
+def _query_market_anchor_stats(
+    *,
+    settings: Settings,
+    query_text: str,
+    market_question: str,
+) -> tuple[int, set[str]]:
+    query_anchor_tokens = _extract_query_anchor_tokens(
+        query_text=query_text,
+        max_tokens=settings.risk_anchor_entity_max_tokens,
+    )
+    if not query_anchor_tokens:
+        return 0, set()
+
+    market_tokens = _tokenize_overlap_text(market_question)
+    overlap_count = len(query_anchor_tokens & market_tokens)
+    return overlap_count, query_anchor_tokens
+
+
+def _extract_query_anchor_tokens(
+    *,
+    query_text: str,
+    max_tokens: int,
+) -> set[str]:
+    query_tokens = _tokenize_overlap_text(query_text)
+    filtered_tokens = [
+        token for token in query_tokens if token not in ANCHOR_GENERIC_TOKENS
+    ]
+    ranked_tokens = sorted(filtered_tokens, key=lambda token: (-len(token), token))
+    return set(ranked_tokens[:max_tokens])
 
 
 async def run_risk_engine(
