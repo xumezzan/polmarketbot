@@ -64,6 +64,48 @@ class RecentSignalsResponse(BaseModel):
     items: list[RecentSignalItem] = Field(default_factory=list)
 
 
+class SignalAuditItem(BaseModel):
+    """Operator-friendly audit row for one signal and its linked snapshots."""
+
+    signal_id: int
+    created_at: str
+    analysis_id: int
+    news_item_id: int
+    news_title: str
+    news_source: str
+    news_published_at: str | None = None
+    market_query: str
+    llm_reason: str
+    direction: str
+    confidence: float
+    relevance: float
+    market_id: str
+    market_question: str | None = None
+    signal_status: str
+    edge: float
+    market_price: float
+    fair_probability: float
+    candidate_count: int | None = None
+    match_score: float | None = None
+    match_reasons: list[str] = Field(default_factory=list)
+    liquidity: float | None = None
+    best_bid: float | None = None
+    best_ask: float | None = None
+    top_candidate_score_delta: float | None = None
+    risk_allow: bool | None = None
+    risk_blockers: list[str] = Field(default_factory=list)
+    approved_size_usd: float | None = None
+
+
+class SignalAuditResponse(BaseModel):
+    """Detailed signal audit response for manual review."""
+
+    generated_at: str
+    limit: int
+    count: int
+    items: list[SignalAuditItem] = Field(default_factory=list)
+
+
 class OpenPositionItem(BaseModel):
     """One open position row for operator view."""
 

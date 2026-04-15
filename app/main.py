@@ -21,6 +21,7 @@ from app.schemas.admin import (
     AdminStatusResponse,
     KillSwitchStatus,
     OpenPositionsResponse,
+    SignalAuditResponse,
     RecentSignalsResponse,
 )
 from app.services.alerting import AlertingService, build_alert_client, get_alerting_runtime_status
@@ -94,6 +95,20 @@ async def admin_recent_signals(
     """Return latest signal rows for quick operator review."""
     service = _build_operator_service(session)
     return await service.get_recent_signals(limit=limit)
+
+
+@app.get("/admin/signals/audit", response_model=SignalAuditResponse)
+async def admin_signal_audit(
+    limit: int = Query(
+        default=settings.operator_recent_signals_default_limit,
+        ge=1,
+        le=settings.operator_recent_signals_max_limit,
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> SignalAuditResponse:
+    """Return detailed news->market->risk audit rows for recent signals."""
+    service = _build_operator_service(session)
+    return await service.get_signal_audit(limit=limit)
 
 
 @app.get("/admin/positions/open", response_model=OpenPositionsResponse)

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from app.config import Settings
 from app.repositories.analysis_repo import AnalysisRepository
@@ -15,6 +16,8 @@ from app.schemas.admin import (
     AdminStatusResponse,
     OpenPositionItem,
     OpenPositionsResponse,
+    SignalAuditItem,
+    SignalAuditResponse,
     RecentSignalItem,
     RecentSignalsResponse,
 )
@@ -29,6 +32,58 @@ def _to_iso(value: datetime | None) -> str | None:
 
 def _to_float(value: float | Decimal) -> float:
     return float(value)
+
+
+def _analysis_snapshots(raw_response: dict[str, Any] | None) -> dict[str, Any]:
+    if not raw_response:
+        return {}
+    snapshots = raw_response.get("snapshots")
+    return snapshots if isinstance(snapshots, dict) else {}
+
+
+def _find_signal_snapshot(
+    *,
+    raw_response: dict[str, Any] | None,
+    signal_id: int,
+) -> dict[str, Any] | None:
+    signal_engine = _analysis_snapshots(raw_response).get("signal_engine") or {}
+    signal_items = signal_engine.get("signals") or []
+    for item in signal_items:
+        if isinstance(item, dict) and item.get("signal_id") == signal_id:
+            return item
+    return None
+
+
+def _find_risk_decision(
+    *,
+    raw_response: dict[str, Any] | None,
+    signal_id: int,
+) -> dict[str, Any] | None:
+    risk_engine = _analysis_snapshots(raw_response).get("risk_engine") or {}
+    decisions = risk_engine.get("decisions") or []
+    for item in decisions:
+        if isinstance(item, dict) and item.get("signal_id") == signal_id:
+            return item
+    return None
+
+
+def _extract_market_matching_context(
+    raw_response: dict[str, Any] | None,
+) -> tuple[int | None, float | None]:
+    market_matching = _analysis_snapshots(raw_response).get("market_matching") or {}
+    candidate_count = market_matching.get("candidate_count")
+    candidates = market_matching.get("candidates") or []
+    scores = sorted(
+        [
+            float(item["match_score"])
+            for item in candidates
+            if isinstance(item, dict) and item.get("match_score") is not None
+        ],
+        reverse=True,
+    )
+    if len(scores) < 2:
+        return candidate_count, None
+    return candidate_count, round(scores[0] - scores[1], 6)
 
 
 class OperatorService:
@@ -140,6 +195,103 @@ class OperatorService:
             )
 
         return RecentSignalsResponse(
+            generated_at=now.isoformat(),
+            limit=limit,
+            count=len(items),
+            items=items,
+        )
+
+    async def get_signal_audit(self, *, limit: int) -> SignalAuditResponse:
+        now = datetime.now(UTC)
+        signals = await self.signal_repository.list_recent(limit=limit)
+
+        items: list[SignalAuditItem] = []
+        for signal in signals:
+            analysis = signal.analysis
+            news_item = analysis.news_item
+            raw_response = analysis.raw_response or {}
+            signal_snapshot = _find_signal_snapshot(
+                raw_response=raw_response,
+                signal_id=signal.id,
+            ) or {}
+            risk_decision = _find_risk_decision(
+                raw_response=raw_response,
+                signal_id=signal.id,
+            ) or {}
+            candidate = signal_snapshot.get("candidate") or {}
+            checks = risk_decision.get("checks") or {}
+            candidate_count, top_candidate_score_delta = _extract_market_matching_context(
+                raw_response
+            )
+
+            items.append(
+                SignalAuditItem(
+                    signal_id=signal.id,
+                    created_at=signal.created_at.isoformat(),
+                    analysis_id=analysis.id,
+                    news_item_id=news_item.id,
+                    news_title=news_item.title,
+                    news_source=news_item.source,
+                    news_published_at=_to_iso(news_item.published_at),
+                    market_query=analysis.market_query,
+                    llm_reason=analysis.reason,
+                    direction=analysis.direction.value,
+                    confidence=_to_float(analysis.confidence),
+                    relevance=_to_float(analysis.relevance),
+                    market_id=signal.market_id,
+                    market_question=signal.market_question,
+                    signal_status=signal.signal_status.value,
+                    edge=_to_float(signal.edge),
+                    market_price=_to_float(signal.market_price),
+                    fair_probability=_to_float(signal.fair_probability),
+                    candidate_count=(
+                        int(candidate_count) if isinstance(candidate_count, int) else None
+                    ),
+                    match_score=(
+                        float(candidate["match_score"])
+                        if candidate.get("match_score") is not None
+                        else None
+                    ),
+                    match_reasons=[
+                        str(item) for item in (candidate.get("match_reasons") or [])
+                    ],
+                    liquidity=(
+                        float(candidate["liquidity"])
+                        if candidate.get("liquidity") is not None
+                        else None
+                    ),
+                    best_bid=(
+                        float(candidate["best_bid"])
+                        if candidate.get("best_bid") is not None
+                        else None
+                    ),
+                    best_ask=(
+                        float(candidate["best_ask"])
+                        if candidate.get("best_ask") is not None
+                        else None
+                    ),
+                    top_candidate_score_delta=(
+                        float(checks["top_candidate_score_delta"])
+                        if checks.get("top_candidate_score_delta") is not None
+                        else top_candidate_score_delta
+                    ),
+                    risk_allow=(
+                        bool(risk_decision["allow"])
+                        if risk_decision.get("allow") is not None
+                        else None
+                    ),
+                    risk_blockers=[
+                        str(item) for item in (risk_decision.get("blockers") or [])
+                    ],
+                    approved_size_usd=(
+                        float(risk_decision["approved_size_usd"])
+                        if risk_decision.get("approved_size_usd") is not None
+                        else None
+                    ),
+                )
+            )
+
+        return SignalAuditResponse(
             generated_at=now.isoformat(),
             limit=limit,
             count=len(items),
