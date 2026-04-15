@@ -52,6 +52,16 @@ class TradeRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none() is True
 
+    async def count_trades_for_analysis(self, *, analysis_id: int) -> int:
+        """Return total paper trades already opened from one analysis."""
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(PaperTrade)
+            .join(Signal, PaperTrade.signal_id == Signal.id)
+            .where(Signal.analysis_id == analysis_id)
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
     async def get_position_by_id(self, *, position_id: int) -> Position | None:
         """Return one position with linked signal/analysis/news context."""
         stmt = self._position_with_context().where(Position.id == position_id)
