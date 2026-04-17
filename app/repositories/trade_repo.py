@@ -135,15 +135,22 @@ class TradeRepository:
         *,
         limit: int = 5,
         descending: bool = True,
+        since: datetime | None = None,
     ) -> list[PaperTrade]:
         """Return best or worst closed trades by realized PnL."""
         order_column = PaperTrade.pnl.desc() if descending else PaperTrade.pnl.asc()
+        conditions: list[sa.ColumnElement[bool]] = [
+            PaperTrade.status == TradeStatus.CLOSED,
+            PaperTrade.pnl.is_not(None),
+        ]
+        if since is not None:
+            conditions.append(
+                PaperTrade.closed_at.is_not(None),
+            )
+            conditions.append(PaperTrade.closed_at >= since)
         stmt = (
             self._trade_with_context()
-            .where(
-                PaperTrade.status == TradeStatus.CLOSED,
-                PaperTrade.pnl.is_not(None),
-            )
+            .where(*conditions)
             .order_by(order_column, PaperTrade.closed_at.desc().nullslast(), PaperTrade.id.desc())
             .limit(limit)
         )

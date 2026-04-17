@@ -110,6 +110,8 @@ class DashboardSnapshot:
     open_position_rows: list[DashboardPositionRow] | None = None
     top_win_rows: list[DashboardTradeRow] | None = None
     top_loss_rows: list[DashboardTradeRow] | None = None
+    top_win_rows_24h: list[DashboardTradeRow] | None = None
+    top_loss_rows_24h: list[DashboardTradeRow] | None = None
     recent_cycle_rows: list[DashboardCycleRow] | None = None
     recent_cycle_ids: list[str] | None = None
 
@@ -138,6 +140,7 @@ class SchedulerDashboard:
         self.status = "IDLE"
         self.main_view = "CLOSED"
         self.category_filter = "ALL"
+        self.leaderboard_mode = "ALL-TIME"
         self.cycle_number = 0
         self.active_cycle_id: str | None = None
         self.next_run_at: datetime | None = None
@@ -177,6 +180,16 @@ class SchedulerDashboard:
             open_positions = await trade_repository.list_open_positions()
             top_wins = await trade_repository.list_top_closed_trades(limit=20, descending=True)
             top_losses = await trade_repository.list_top_closed_trades(limit=20, descending=False)
+            top_wins_24h = await trade_repository.list_top_closed_trades(
+                limit=20,
+                descending=True,
+                since=since_24h,
+            )
+            top_losses_24h = await trade_repository.list_top_closed_trades(
+                limit=20,
+                descending=False,
+                since=since_24h,
+            )
             recent_cycles = await cycle_repository.list_recent(limit=5)
             cycles_24h = await cycle_repository.count_cycles_since(since=since_24h)
             failed_cycles_24h = await cycle_repository.count_failed_cycles_since(since=since_24h)
@@ -233,6 +246,8 @@ class SchedulerDashboard:
             ],
             top_win_rows=[self._trade_row_from_model(trade) for trade in top_wins],
             top_loss_rows=[self._trade_row_from_model(trade) for trade in top_losses],
+            top_win_rows_24h=[self._trade_row_from_model(trade) for trade in top_wins_24h],
+            top_loss_rows_24h=[self._trade_row_from_model(trade) for trade in top_losses_24h],
             recent_cycle_rows=[
                 DashboardCycleRow(
                     cycle_id=str(cycle.cycle_id),
@@ -307,6 +322,7 @@ class SchedulerDashboard:
         layout["sidecar"].split_column(
             Layout(name="cycles", size=11),
             Layout(name="leaders", size=14),
+            Layout(name="alerts", size=10),
             Layout(name="engine"),
         )
 
@@ -315,6 +331,7 @@ class SchedulerDashboard:
         layout["main"].update(self._build_main_panel())
         layout["cycles"].update(self._build_cycles_panel())
         layout["leaders"].update(self._build_leaders_panel())
+        layout["alerts"].update(self._build_alerts_panel())
         layout["engine"].update(self._build_engine_panel())
         layout["terminal"].update(self._build_terminal_panel())
         layout["footer"].update(self._build_footer())
@@ -473,18 +490,21 @@ class SchedulerDashboard:
     def _build_leaders_panel(self):
         wins = self._build_leader_table(
             "TOP WINS",
-            self._filtered_trade_rows(self.snapshot.top_win_rows or []),
+            self._leader_rows(positive=True),
             positive=True,
         )
         losses = self._build_leader_table(
             "TOP LOSSES",
-            self._filtered_trade_rows(self.snapshot.top_loss_rows or []),
+            self._leader_rows(positive=False),
             positive=False,
         )
         return Panel(
             Group(wins, Text(""), losses),
             title=self._panel_title("SCOREBOARD"),
-            subtitle=Text(f"filter {self.category_filter.lower()}", style="grey70"),
+            subtitle=Text(
+                f"{self.leaderboard_mode.lower()} | filter {self.category_filter.lower()}",
+                style="grey70",
+            ),
             border_style="bright_black",
             box=box.SQUARE,
         )
@@ -523,6 +543,33 @@ class SchedulerDashboard:
                 Text(self._format_money(trade.pnl or 0.0), style=self._pnl_style(trade.pnl)),
             )
         return table
+
+    def _build_alerts_panel(self):
+        alert_tags = {"WIN", "LOSS", "BLOCK"}
+        recent_alerts = [line for line in self.log_lines if line.tag.upper() in alert_tags][-6:]
+        if not recent_alerts:
+            return Panel(
+                Text("No win/loss/block alerts yet.", style="dim"),
+                title=self._panel_title("ALERTS"),
+                border_style="bright_black",
+                box=box.SQUARE,
+            )
+
+        rendered = []
+        for line in recent_alerts:
+            style = self._terminal_style(line.tag, line.style)
+            text = Text()
+            text.append(f"[{line.timestamp}] ", style="dim")
+            text.append(f"{line.tag:<5}", style=style)
+            text.append(" ")
+            text.append(line.message, style=style)
+            rendered.append(text)
+        return Panel(
+            Group(*rendered),
+            title=self._panel_title("ALERTS"),
+            border_style="bright_black",
+            box=box.SQUARE,
+        )
 
     def _build_cycles_panel(self):
         table = Table(
@@ -601,6 +648,7 @@ class SchedulerDashboard:
         command.append("./penny_sniper ", style="bold white")
         command.append(f"--view={self.main_view.lower()} ", style="yellow")
         command.append(f"--filter={self.category_filter.lower()} ", style="yellow")
+        command.append(f"--leaders={self.leaderboard_mode.lower()} ", style="yellow")
         command.append(f"--interval={self.interval_minutes:g}m ", style="yellow")
         command.append(f"--source={self.settings.news_fetch_mode.lower()} ", style="yellow")
         command.append(f"--llm={self.settings.llm_mode.lower()}", style="yellow")
@@ -619,6 +667,8 @@ class SchedulerDashboard:
         status.append(str(self.snapshot.open_positions), style="bold white")
         status.append("   FILTER: ", style="dim")
         status.append(self.category_filter.lower(), style="bold yellow")
+        status.append("   LEADERS: ", style="dim")
+        status.append(self.leaderboard_mode.lower(), style="bold yellow")
         status.append("   WIN RATE: ", style="dim")
         status.append(f"{self.snapshot.win_rate * 100:.1f}%", style="bold cyan")
         status.append("   24H CYCLES: ", style="dim")
@@ -627,6 +677,8 @@ class SchedulerDashboard:
         status.append("toggle", style="bold cyan")
         status.append("   [c] ", style="dim")
         status.append("filter", style="bold yellow")
+        status.append("   [t] ", style="dim")
+        status.append("leaders", style="bold yellow")
         status.append("   [r] ", style="dim")
         status.append("refresh", style="bold cyan")
         status.append("   [q] ", style="dim")
@@ -828,7 +880,16 @@ class SchedulerDashboard:
         title.append(secondary, style="grey50")
         title.append("  |  ", style="dim")
         title.append(self.category_filter.lower(), style="bold yellow")
+        title.append("  |  ", style="dim")
+        title.append(self.leaderboard_mode.lower(), style="bold yellow")
         return title
+
+    def _leader_rows(self, *, positive: bool) -> list[DashboardTradeRow]:
+        if self.leaderboard_mode == "24H":
+            source = self.snapshot.top_win_rows_24h if positive else self.snapshot.top_loss_rows_24h
+        else:
+            source = self.snapshot.top_win_rows if positive else self.snapshot.top_loss_rows
+        return self._filtered_trade_rows(source or [])
 
     def _filtered_trade_rows(self, rows: list[DashboardTradeRow]) -> list[DashboardTradeRow]:
         if self.category_filter == "ALL":
@@ -939,6 +1000,9 @@ class SchedulerDashboard:
         current_index = filters.index(self.category_filter)
         self.category_filter = filters[(current_index + 1) % len(filters)]
 
+    def _toggle_leaderboard_mode(self) -> None:
+        self.leaderboard_mode = "24H" if self.leaderboard_mode == "ALL-TIME" else "ALL-TIME"
+
     def _terminal_style(self, tag: str, fallback: str) -> str:
         normalized = tag.upper()
         if normalized in {"WIN", "OPEN"}:
@@ -946,6 +1010,8 @@ class SchedulerDashboard:
         if normalized in {"LOSS", "FAIL"}:
             return "bold red"
         if normalized in {"BLOCK", "SKIP"}:
+            return "bold yellow"
+        if normalized in {"LEAD", "FILT"}:
             return "bold yellow"
         if normalized in {"MATCH", "FETCH"}:
             return "bold cyan"
@@ -975,6 +1041,9 @@ class SchedulerDashboard:
             elif normalized == "c":
                 self._cycle_category_filter()
                 self.log("FILT", f"market filter -> {self.category_filter.lower()}", style="yellow")
+            elif normalized == "t":
+                self._toggle_leaderboard_mode()
+                self.log("LEAD", f"leaderboard mode -> {self.leaderboard_mode.lower()}", style="yellow")
 
     @contextmanager
     def _keyboard_listener(self):
