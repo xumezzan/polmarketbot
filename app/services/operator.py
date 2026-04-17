@@ -131,6 +131,8 @@ class OperatorService:
         inserted_news_24h = await self.news_repository.count_created_since(since=since)
         analyses_count = await self.analysis_repository.count()
         analyses_count_24h = await self.analysis_repository.count_created_since(since=since)
+        llm_tokens_24h = await self.analysis_repository.sum_total_tokens_since(since=since)
+        llm_cost_24h = await self.analysis_repository.sum_estimated_cost_since(since=since)
         signals_count = await self.signal_repository.count()
         signals_count_24h = await self.signal_repository.count_created_since(since=since)
         paper_trades_count = await self.trade_repository.count_trades()
@@ -166,6 +168,8 @@ class OperatorService:
             },
             inserted_news_24h=inserted_news_24h,
             analyses_count_24h=analyses_count_24h,
+            llm_tokens_24h=llm_tokens_24h,
+            llm_cost_24h=round(llm_cost_24h, 6),
             signals_count_24h=signals_count_24h,
             opened_trades_24h=opened_trades_24h,
             closed_trades_24h=closed_trades_24h,

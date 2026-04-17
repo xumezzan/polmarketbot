@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     openai_timeout_seconds: float = 30.0
     openai_temperature: float = 0.0
     openai_max_completion_tokens: int = 300
+    openai_input_cost_per_1m_tokens: float = 0.15
+    openai_output_cost_per_1m_tokens: float = 0.60
+    openai_daily_budget_usd: float = 0.0
     llm_max_content_chars: int = 4000
     news_api_key: str = ""
     rss_feed_urls: str = ""
@@ -57,6 +60,7 @@ class Settings(BaseSettings):
     rss_max_items_per_feed: int = 20
     market_fetch_mode: str = "stub"
     gamma_api_base_url: str = "https://gamma-api.polymarket.com"
+    clob_api_base_url: str = "https://clob.polymarket.com"
     gamma_markets_page_size: int = 200
     gamma_markets_max_pages: int = 5
     gamma_fetch_active_only: bool = True
@@ -77,6 +81,14 @@ class Settings(BaseSettings):
     signal_actionable_confidence_threshold: float = 0.70
     signal_actionable_relevance_threshold: float = 0.65
     signal_watchlist_edge_threshold: float = 0.01
+    signal_calibration_enabled: bool = True
+    signal_calibration_min_samples: int = 5
+    signal_calibration_bucket_size: float = 0.10
+    signal_calibration_prior_strength: float = 3.0
+    signal_market_consensus_liquidity_cap: float = 250000.0
+    signal_market_consensus_max_weight: float = 0.35
+    signal_liquidity_penalty_factor: float = 0.20
+    signal_liquidity_penalty_cap: float = 0.03
     risk_min_confidence: float = 0.70
     risk_min_relevance: float = 0.65
     risk_max_news_age_minutes: int = 360

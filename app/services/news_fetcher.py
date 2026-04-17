@@ -22,6 +22,7 @@ from app.services.retry_utils import retry_async
 logger = logging.getLogger(__name__)
 _NEWSAPI_COOLDOWN_UNTIL: datetime | None = None
 _NEWSAPI_NEXT_ALLOWED_FETCH_AT: datetime | None = None
+_RSS_USER_AGENT = "PolymarketNewsBot/1.0 (+https://example.com/rss-ingest)"
 
 
 class NewsClientProtocol(Protocol):
@@ -359,6 +360,9 @@ class StubNewsClient:
     source_mode = "stub"
 
     async def fetch_latest(self) -> list[NewsApiArticle]:
+        now = datetime.now(UTC).replace(microsecond=0)
+        bitcoin_published_at = (now - timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+        fed_published_at = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
         stub_payload = {
             "status": "ok",
             "totalResults": 3,
@@ -370,7 +374,7 @@ class StubNewsClient:
                     "description": "Traders react to a fresh ETF rumor in early trading.",
                     "url": "https://example.com/markets/bitcoin-rally?utm_source=test",
                     "urlToImage": "https://example.com/images/bitcoin.png",
-                    "publishedAt": "2026-04-13T09:00:00Z",
+                    "publishedAt": bitcoin_published_at,
                     "content": "Traders react to a fresh ETF rumor in early trading. [+128 chars]",
                 },
                 {
@@ -380,7 +384,7 @@ class StubNewsClient:
                     "description": "Risk assets wobble as a Fed official sounds cautious.",
                     "url": "https://example.com/macro/fed-signals-slower-cuts",
                     "urlToImage": None,
-                    "publishedAt": "2026-04-13T10:15:00Z",
+                    "publishedAt": fed_published_at,
                     "content": "Risk assets wobble as a Fed official sounds cautious.",
                 },
                 {
@@ -390,7 +394,7 @@ class StubNewsClient:
                     "description": "Traders react to a fresh ETF rumor in early trading.",
                     "url": "https://example.com/markets/bitcoin-rally",
                     "urlToImage": "https://example.com/images/bitcoin.png",
-                    "publishedAt": "2026-04-13T09:00:00Z",
+                    "publishedAt": bitcoin_published_at,
                     "content": "Traders react to a fresh ETF rumor in early trading. [+128 chars]",
                 },
             ],
@@ -428,7 +432,11 @@ class RssNewsClient:
             return []
 
         all_articles: list[NewsApiArticle] = []
-        async with httpx.AsyncClient(timeout=self.settings.rss_request_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.settings.rss_request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": _RSS_USER_AGENT},
+        ) as client:
             for feed_url in feed_urls:
                 try:
                     response = await client.get(feed_url)

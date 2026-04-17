@@ -3,6 +3,8 @@ from datetime import UTC, datetime
 
 from app.services.news_fetcher import (
     FallbackNewsClient,
+    RssNewsClient,
+    StubNewsClient,
     filter_rss_articles_by_source,
     get_newsapi_cooldown_remaining_seconds,
     get_newsapi_fetch_interval_remaining_seconds,
@@ -11,6 +13,7 @@ from app.services.news_fetcher import (
     resolve_newsapi_next_allowed_fetch_at,
     resolve_newsapi_cooldown_until,
 )
+from tests.helpers import build_test_settings
 
 
 def test_news_fetcher_uses_fallback_lookback_when_enabled() -> None:
@@ -90,6 +93,16 @@ def test_newsapi_fetch_interval_remaining_seconds_returns_none_when_expired() ->
     )
 
     assert remaining_seconds is None
+
+
+def test_stub_news_client_returns_recent_articles() -> None:
+    articles = asyncio.run(StubNewsClient().fetch_latest())
+
+    assert len(articles) == 3
+    now = datetime.now(UTC)
+    for article in articles:
+        age_minutes = (now - article.published_at).total_seconds() / 60
+        assert 0 <= age_minutes <= 60
 
 
 def test_parse_rss_feed_articles_returns_newsapi_articles() -> None:
@@ -235,6 +248,57 @@ def test_filter_rss_articles_by_source_respects_allowlist() -> None:
     assert [article.source.name for article in filtered_articles] == ["Reuters"]
     assert blocked_count == 0
     assert allowlist_miss_count == 1
+
+
+def test_rss_news_client_uses_redirects_and_user_agent(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        text = """
+        <rss version="2.0">
+          <channel>
+            <title>Example Feed</title>
+            <item>
+              <title>Bitcoin ETF headline</title>
+              <link>https://example.com/story</link>
+              <description>Body</description>
+              <pubDate>Tue, 15 Apr 2026 12:00:00 GMT</pubDate>
+            </item>
+          </channel>
+        </rss>
+        """
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url: str):
+            captured["feed_url"] = url
+            return FakeResponse()
+
+    monkeypatch.setattr("app.services.news_fetcher.httpx.AsyncClient", FakeAsyncClient)
+
+    settings = build_test_settings(
+        news_fetch_mode="rss",
+        rss_feed_urls="https://example.com/rss.xml",
+        rss_allowed_sources="",
+        rss_blocked_sources="",
+    )
+    articles = asyncio.run(RssNewsClient(settings).fetch_latest())
+
+    assert len(articles) == 1
+    assert captured["feed_url"] == "https://example.com/rss.xml"
+    assert captured["follow_redirects"] is True
+    assert "User-Agent" in captured["headers"]
 
 
 class _FakeNewsClient:

@@ -4,13 +4,31 @@ import logging
 from datetime import UTC, datetime
 from typing import Protocol
 
-from openai import (
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    AsyncOpenAI,
-    OpenAIError,
-)
+try:
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        APITimeoutError,
+        AsyncOpenAI,
+        OpenAIError,
+    )
+except ImportError:  # pragma: no cover - exercised only in stripped test envs
+    class OpenAIError(Exception):
+        """Fallback base error when the OpenAI SDK is unavailable."""
+
+    class APIConnectionError(OpenAIError):
+        """Fallback connection error."""
+
+    class APITimeoutError(OpenAIError):
+        """Fallback timeout error."""
+
+    class APIStatusError(OpenAIError):
+        """Fallback HTTP status error."""
+
+        status_code: int | None = None
+        request_id: str | None = None
+
+    AsyncOpenAI = None
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -21,10 +39,53 @@ from app.models.news import NewsItem
 from app.repositories.analysis_repo import AnalysisRepository
 from app.repositories.news_repo import NewsRepository
 from app.schemas.verdict import AnalysisRunResult, Verdict
+from app.services.forecasting import estimate_openai_cost_usd
 from app.services.retry_utils import retry_async
 
 
 logger = logging.getLogger(__name__)
+
+_BTC_POSITIVE_HINTS = (
+    "etf",
+    "treasury",
+    "adoption",
+    "inflow",
+    "product",
+    "rally",
+    "rallies",
+    "surge",
+    "surges",
+    "gain",
+    "gains",
+    "bull",
+    "record",
+    "buy",
+    "buys",
+    "launch",
+    "approval",
+)
+_BTC_AMBIGUOUS_HINTS = (
+    "tremble",
+    "trembles",
+    "drift",
+    "drifts",
+    "fall",
+    "falls",
+    "drop",
+    "drops",
+    "selloff",
+    "volatility",
+    "risk",
+)
+_FED_HINTS = (
+    "federal reserve",
+    "fed chair",
+    "powell",
+    "rate cut",
+    "rate cuts",
+    "interest rate",
+    "interest rates",
+)
 
 
 class LLMAnalysisError(Exception):
@@ -46,28 +107,84 @@ class StubLLMClient:
         content = (news_item.content or "").lower()
         text = f"{title}\n{content}"
 
-        if "bitcoin" in text or "etf" in text or "crypto" in text:
+        has_bitcoin = any(token in text for token in ("bitcoin", "btc"))
+        has_crypto = "crypto" in text
+        has_etf = "etf" in text
+        has_fed = _contains_any(text, _FED_HINTS) or "fed" in text
+        references_bitcoin_market = has_bitcoin or has_etf or has_crypto
+
+        if references_bitcoin_market and any(
+            token in text for token in ("$1m", "1m", "one million", "gta vi")
+        ):
             verdict = Verdict(
-                relevance=0.86,
-                confidence=0.79,
+                relevance=0.88,
+                confidence=0.82,
                 direction="YES",
-                fair_probability=0.67,
-                market_query="bitcoin price",
+                fair_probability=0.64,
+                market_query="bitcoin 1m gta vi",
                 reason=(
-                    "The article is directly about crypto market sentiment and suggests "
-                    "a positive move for a matching bitcoin-related market."
+                    "The article directly references an extreme bitcoin upside target, so "
+                    "the stub maps it to a specific long-dated bitcoin milestone market."
                 ),
             )
-        elif "fed" in text or "rate" in text:
+        elif references_bitcoin_market and _contains_any(text, _BTC_POSITIVE_HINTS):
             verdict = Verdict(
-                relevance=0.58,
-                confidence=0.68,
+                relevance=0.87,
+                confidence=0.80,
+                direction="YES",
+                fair_probability=0.67,
+                market_query="bitcoin 150k june 2026",
+                reason=(
+                    "The article looks like a bullish bitcoin catalyst, so the stub maps "
+                    "it to a concrete upside target instead of a vague bitcoin price query."
+                ),
+            )
+        elif references_bitcoin_market and _contains_any(text, _BTC_AMBIGUOUS_HINTS):
+            verdict = Verdict(
+                relevance=0.62,
+                confidence=0.66,
                 direction="NONE",
                 fair_probability=0.50,
-                market_query="federal reserve rates",
+                market_query="bitcoin 150k june 2026",
                 reason=(
-                    "The article matters for macro sentiment, but it does not give a "
-                    "clean binary edge for a Polymarket trade yet."
+                    "The article is about bitcoin but the directional edge is weak, so the "
+                    "stub keeps a neutral verdict while still pointing to a matchable market."
+                ),
+            )
+        elif has_fed and not references_bitcoin_market:
+            verdict = Verdict(
+                relevance=0.61,
+                confidence=0.70,
+                direction="NONE",
+                fair_probability=0.50,
+                market_query="fed rate cuts 2026",
+                reason=(
+                    "The article matters for macro sentiment, but it still looks too "
+                    "indirect for a clean binary trade in the stub path."
+                ),
+            )
+        elif references_bitcoin_market:
+            verdict = Verdict(
+                relevance=0.55,
+                confidence=0.60,
+                direction="NONE",
+                fair_probability=0.50,
+                market_query="bitcoin 150k june 2026",
+                reason=(
+                    "The article touches crypto, but the catalyst is too fuzzy for a "
+                    "directional trade, so the stub stays neutral on a concrete market."
+                ),
+            )
+        elif has_fed:
+            verdict = Verdict(
+                relevance=0.56,
+                confidence=0.64,
+                direction="NONE",
+                fair_probability=0.50,
+                market_query="fed rate cuts 2026",
+                reason=(
+                    "The article looks macro-relevant, so the stub maps it to a rate-cut "
+                    "market while keeping the direction neutral."
                 ),
             )
         else:
@@ -91,6 +208,11 @@ class StubLLMClient:
         return verdict, raw_response
 
 
+def _contains_any(text: str, patterns: tuple[str, ...]) -> bool:
+    """Return True when the input contains any of the configured hint phrases."""
+    return any(pattern in text for pattern in patterns)
+
+
 class OpenAILLMClient:
     """
     OpenAI adapter for structured verdict generation.
@@ -105,6 +227,8 @@ class OpenAILLMClient:
     def __init__(self, settings: Settings) -> None:
         if not settings.openai_api_key:
             raise LLMAnalysisError("OPENAI_API_KEY is required when LLM_MODE=openai")
+        if AsyncOpenAI is None:
+            raise LLMAnalysisError("openai package is required when LLM_MODE=openai")
 
         self.settings = settings
         self.client = AsyncOpenAI(
@@ -183,6 +307,7 @@ class OpenAILLMClient:
             "model": self.settings.openai_model,
             "request_id": getattr(completion, "_request_id", None),
             "message_content": message.content,
+            "usage": _extract_openai_usage(completion=completion, settings=self.settings),
             "verdict": parsed_verdict.model_dump(mode="json"),
         }
         return parsed_verdict, raw_response
@@ -231,6 +356,43 @@ def build_llm_client(settings: Settings) -> LLMClientProtocol:
     raise ValueError("Unsupported LLM_MODE. Expected 'stub' or 'openai'.")
 
 
+def _extract_openai_usage(
+    *,
+    completion,
+    settings: Settings,
+) -> dict[str, int | float] | None:
+    usage = getattr(completion, "usage", None)
+    if usage is None:
+        return None
+
+    prompt_tokens = _coerce_int(getattr(usage, "prompt_tokens", None))
+    completion_tokens = _coerce_int(getattr(usage, "completion_tokens", None))
+    total_tokens = _coerce_int(getattr(usage, "total_tokens", None))
+    if prompt_tokens is None or completion_tokens is None or total_tokens is None:
+        return None
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": estimate_openai_cost_usd(
+            settings=settings,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        ),
+    }
+
+
+def _coerce_int(value: object) -> int | None:
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class LLMAnalyzerService:
     """Loads a news item, gets a verdict, and stores it in analyses."""
 
@@ -272,11 +434,19 @@ class LLMAnalyzerService:
                 verdict=verdict,
             )
 
+        await self._enforce_daily_budget()
         verdict, raw_response = await self.client.analyze_news_item(news_item)
+        usage = self._extract_usage(raw_response)
         analysis = await self.analysis_repository.create(
             news_item_id=news_item.id,
             verdict=verdict,
             raw_response=raw_response,
+            llm_provider=self._extract_raw_field(raw_response, "provider"),
+            llm_model=self._extract_raw_field(raw_response, "model"),
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            estimated_cost_usd=usage["estimated_cost_usd"],
         )
 
         log_event(
@@ -296,6 +466,21 @@ class LLMAnalyzerService:
             verdict=verdict,
         )
 
+    async def _enforce_daily_budget(self) -> None:
+        if not isinstance(self.client, OpenAILLMClient):
+            return
+
+        if self.client.settings.openai_daily_budget_usd <= 0:
+            return
+
+        day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        spent = await self.analysis_repository.sum_estimated_cost_since(since=day_start)
+        if spent >= self.client.settings.openai_daily_budget_usd:
+            raise LLMAnalysisError(
+                "OpenAI daily budget exceeded: "
+                f"{spent:.6f}>={self.client.settings.openai_daily_budget_usd:.6f}"
+            )
+
     async def _load_news_item(self, news_item_id: int | None) -> NewsItem | None:
         if news_item_id is not None:
             return await self.news_repository.get_by_id(news_item_id)
@@ -310,6 +495,38 @@ class LLMAnalyzerService:
             market_query=analysis.market_query,
             reason=analysis.reason,
         )
+
+    def _extract_usage(
+        self,
+        raw_response: dict[str, object] | None,
+    ) -> dict[str, int | float | None]:
+        usage = (raw_response or {}).get("usage")
+        if not isinstance(usage, dict):
+            return {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "estimated_cost_usd": None,
+            }
+
+        return {
+            "prompt_tokens": _coerce_int(usage.get("prompt_tokens")),
+            "completion_tokens": _coerce_int(usage.get("completion_tokens")),
+            "total_tokens": _coerce_int(usage.get("total_tokens")),
+            "estimated_cost_usd": (
+                float(usage["estimated_cost_usd"])
+                if usage.get("estimated_cost_usd") is not None
+                else None
+            ),
+        }
+
+    def _extract_raw_field(
+        self,
+        raw_response: dict[str, object] | None,
+        field_name: str,
+    ) -> str | None:
+        value = (raw_response or {}).get(field_name)
+        return str(value) if value is not None else None
 
 
 async def run_llm_analysis(

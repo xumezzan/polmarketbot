@@ -51,6 +51,9 @@ class MarketClientProtocol(Protocol):
     async def fetch_markets(self) -> list[GammaMarket]:
         """Return a list of normalized markets."""
 
+    async def fetch_market(self, market_id: str) -> GammaMarket | None:
+        """Return one normalized market snapshot by id."""
+
 
 class StubPolymarketClient:
     """Fake market provider for local end-to-end tests."""
@@ -186,6 +189,12 @@ class StubPolymarketClient:
 
         return [self._normalize_market(payload) for payload in stub_payloads]
 
+    async def fetch_market(self, market_id: str) -> GammaMarket | None:
+        for market in await self.fetch_markets():
+            if market.id == market_id:
+                return market
+        return None
+
     def _normalize_market(self, payload: dict[str, object]) -> GammaMarket:
         market = GammaMarket.model_validate(payload)
         market.raw_payload = payload
@@ -260,6 +269,52 @@ class GammaPolymarketClient:
             max_pages=self.settings.gamma_markets_max_pages,
         )
         return markets
+
+    async def fetch_market(self, market_id: str) -> GammaMarket | None:
+        base_url = f"{self.settings.gamma_api_base_url.rstrip('/')}/markets/{market_id}"
+
+        async with httpx.AsyncClient(timeout=self.settings.gamma_request_timeout_seconds) as client:
+            async def _request_once() -> httpx.Response:
+                response = await client.get(base_url)
+                response.raise_for_status()
+                return response
+
+            try:
+                response = await retry_async(
+                    _request_once,
+                    logger=logger,
+                    provider="polymarket_gamma",
+                    operation_name="fetch_market_by_id",
+                    max_attempts=self.settings.gamma_retry_max_attempts,
+                    base_delay_seconds=self.settings.gamma_retry_base_delay_seconds,
+                    is_retryable=_is_retryable_gamma_exception,
+                    context={"market_id": market_id},
+                )
+            except httpx.HTTPError as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+                    return None
+                log_event(
+                    logger,
+                    "gamma_single_market_fetch_failed",
+                    provider="polymarket_gamma",
+                    market_id=market_id,
+                    error=str(exc),
+                )
+                raise MarketClientError(f"Gamma market fetch failed: {exc}") from exc
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise MarketClientError("Gamma /markets/{id} returned a non-object payload.")
+
+        market = self._normalize_market(payload)
+        log_event(
+            logger,
+            "gamma_single_market_fetch_completed",
+            provider="polymarket_gamma",
+            market_id=market_id,
+            closed=market.closed,
+        )
+        return market
 
     def _normalize_market(self, payload: dict[str, object]) -> GammaMarket:
         market = GammaMarket.model_validate(payload)
@@ -377,6 +432,8 @@ class KeywordMarketRanker:
             last_trade_price=market.last_trade_price,
             liquidity=market.liquidity,
             volume=market.volume,
+            fees_enabled=market.fees_enabled,
+            effective_taker_fee_rate=market.effective_taker_fee_rate,
             match_score=total_score,
             match_reasons=reasons,
             score_breakdown=score_breakdown,

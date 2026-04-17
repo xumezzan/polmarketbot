@@ -52,6 +52,9 @@ class PaperTrade(TimestampMixin, Base):
         nullable=False,
         index=True,
     )
+    close_reason: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+    resolution_outcome: Mapped[str | None] = mapped_column(sa.String(20), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     opened_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         server_default=sa.func.now(),

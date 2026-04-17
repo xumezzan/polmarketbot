@@ -34,6 +34,8 @@ class AdminStatusResponse(BaseModel):
     provider_cooldowns: dict[str, dict[str, object]] = Field(default_factory=dict)
     inserted_news_24h: int = 0
     analyses_count_24h: int = 0
+    llm_tokens_24h: int = 0
+    llm_cost_24h: float = 0.0
     signals_count_24h: int = 0
     opened_trades_24h: int = 0
     closed_trades_24h: int = 0

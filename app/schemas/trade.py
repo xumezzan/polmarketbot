@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 
+from app.schemas.forecast_observation import ForecastObservationSyncResult
+
 
 class PaperTradeOpenResult(BaseModel):
     """Result of opening one virtual position."""
@@ -39,6 +41,8 @@ class PaperTradeCloseResult(BaseModel):
     close_reason: str | None = None
     holding_minutes: float | None = None
     current_price_delta: float | None = None
+    resolution_outcome: str | None = None
+    resolved_at: str | None = None
 
 
 class PaperTradeAutoCloseDecision(BaseModel):
@@ -67,6 +71,7 @@ class PaperTradeMaintenanceResult(BaseModel):
     closed_trade_ids: list[int] = Field(default_factory=list)
     closed_results: list["PaperTradeCloseResult"] = Field(default_factory=list)
     decisions: list[PaperTradeAutoCloseDecision] = Field(default_factory=list)
+    observation_sync: ForecastObservationSyncResult | None = None
 
 
 class PaperTradeStats(BaseModel):

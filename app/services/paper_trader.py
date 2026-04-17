@@ -11,11 +11,13 @@ from app.database import AsyncSessionLocal
 from app.logging_utils import configure_logging, log_event
 from app.models.enums import MarketSide, SignalStatus, VerdictDirection
 from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.forecast_observation_repo import ForecastObservationRepository
 from app.repositories.runtime_flag_repo import RuntimeFlagRepository
 from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
 from app.runtime_flags import RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH
 from app.schemas.risk import RiskDecision
+from app.schemas.forecast_observation import ForecastObservationSyncResult
 from app.schemas.trade import (
     PaperRiskBlockerCount,
     PaperTradeAnalytics,
@@ -30,6 +32,7 @@ from app.schemas.trade import (
     PaperTradeStats,
 )
 from app.services.alerting import AlertingService, build_alert_client
+from app.services.forecasting import calculate_brier_score, resolve_market_resolution
 from app.services.market_client import MarketClientProtocol, build_market_client
 from app.services.risk_engine import RiskEngine
 
@@ -71,8 +74,10 @@ def select_exit_market_price(
             return no_price
         if yes_price is not None:
             return round(1 - yes_price, 4)
+        if last_trade_price is not None:
+            return round(1 - last_trade_price, 4)
 
-    if last_trade_price is not None:
+    if last_trade_price is not None and normalized_side == MarketSide.YES.value:
         return last_trade_price
     return None
 
@@ -325,6 +330,7 @@ class PaperTrader:
         signal_repository: SignalRepository,
         analysis_repository: AnalysisRepository,
         trade_repository: TradeRepository,
+        forecast_observation_repository: ForecastObservationRepository,
         runtime_flag_repository: RuntimeFlagRepository,
         market_client: MarketClientProtocol,
     ) -> None:
@@ -332,6 +338,7 @@ class PaperTrader:
         self.signal_repository = signal_repository
         self.analysis_repository = analysis_repository
         self.trade_repository = trade_repository
+        self.forecast_observation_repository = forecast_observation_repository
         self.runtime_flag_repository = runtime_flag_repository
         self.market_client = market_client
         self.risk_engine = RiskEngine(
@@ -400,7 +407,7 @@ class PaperTrader:
             )
 
         side = self._select_side(direction=analysis.direction)
-        entry_price = float(signal.market_price)
+        entry_price = float(signal.execution_price or signal.market_price)
         if entry_price <= 0:
             raise PaperTraderError(
                 f"Signal {signal.id} has non-positive entry price {entry_price:.4f}."
@@ -483,6 +490,8 @@ class PaperTrader:
         close_reason: str | None = None,
         holding_minutes: float | None = None,
         current_price_delta: float | None = None,
+        resolution_outcome: str | None = None,
+        resolved_at: datetime | None = None,
     ) -> PaperTradeCloseResult:
         """Close one open paper position at the provided exit price."""
         if exit_price < 0 or exit_price > 1:
@@ -518,7 +527,32 @@ class PaperTrader:
             exit_price=exit_price,
             pnl=pnl,
             closed_at=closed_at,
+            close_reason=close_reason,
+            resolution_outcome=resolution_outcome,
+            resolved_at=resolved_at,
         )
+
+        if resolution_outcome is not None:
+            await self.forecast_observation_repository.upsert_for_position(
+                signal_id=linked_signal_id,
+                analysis_id=analysis.id,
+                position_id=position.id,
+                market_id=market_id,
+                provider=self._select_provider(analysis),
+                model=self._select_model(analysis),
+                side=side,
+                raw_probability=self._select_raw_probability(position.signal),
+                calibrated_probability=float(position.signal.fair_probability),
+                market_price=float(position.signal.market_price),
+                execution_price=self._select_execution_price(position.signal),
+                outcome_value=exit_price,
+                outcome_label=resolution_outcome,
+                brier_score=calculate_brier_score(
+                    probability=float(position.signal.fair_probability),
+                    outcome_value=exit_price,
+                ),
+                resolved_at=resolved_at or closed_at,
+            )
 
         action_at = closed_at.isoformat()
         await self.analysis_repository.save_paper_trader_action(
@@ -539,6 +573,10 @@ class PaperTrader:
                 "close_reason": close_reason,
                 "holding_minutes": holding_minutes,
                 "current_price_delta": current_price_delta,
+                "resolution_outcome": resolution_outcome,
+                "resolved_at": (resolved_at or closed_at).isoformat()
+                if resolution_outcome is not None
+                else None,
             },
         )
 
@@ -558,6 +596,10 @@ class PaperTrader:
             close_reason=close_reason,
             holding_minutes=holding_minutes,
             current_price_delta=current_price_delta,
+            resolution_outcome=resolution_outcome,
+            resolved_at=(resolved_at or closed_at).isoformat()
+            if resolution_outcome is not None
+            else None,
         )
 
         return PaperTradeCloseResult(
@@ -579,6 +621,10 @@ class PaperTrader:
             close_reason=close_reason,
             holding_minutes=holding_minutes,
             current_price_delta=current_price_delta,
+            resolution_outcome=resolution_outcome,
+            resolved_at=(resolved_at or closed_at).isoformat()
+            if resolution_outcome is not None
+            else None,
         )
 
     async def get_stats(self) -> PaperTradeStats:
@@ -655,20 +701,8 @@ class PaperTrader:
 
     async def maintain_open_positions(self) -> PaperTradeMaintenanceResult:
         """Apply simple auto-close rules to every open paper position."""
-        if not self.settings.paper_auto_close_enabled:
-            log_event(
-                logger,
-                "paper_trade_maintenance_skipped",
-                reason="paper_auto_close_enabled=false",
-            )
-            return PaperTradeMaintenanceResult()
-
         open_positions = await self.trade_repository.list_open_positions()
-        if not open_positions:
-            return PaperTradeMaintenanceResult()
-
-        markets = await self.market_client.fetch_markets()
-        markets_by_id = {market.id: market for market in markets}
+        auto_close_enabled = self.settings.paper_auto_close_enabled
         decisions: list[PaperTradeAutoCloseDecision] = []
         closed_trade_ids: list[int] = []
         closed_results: list[PaperTradeCloseResult] = []
@@ -699,7 +733,7 @@ class PaperTrader:
                 (datetime.now(UTC) - trade.opened_at).total_seconds() / 60,
                 2,
             )
-            market = markets_by_id.get(position.market_id)
+            market = await self.market_client.fetch_market(position.market_id)
             if market is None:
                 decisions.append(
                     PaperTradeAutoCloseDecision(
@@ -712,6 +746,7 @@ class PaperTrader:
                 )
                 continue
 
+            resolution = resolve_market_resolution(market)
             current_price = select_exit_market_price(
                 side=position.side.value,
                 yes_price=market.yes_price,
@@ -725,6 +760,46 @@ class PaperTrader:
                         trade_id=trade.id,
                         action="SKIPPED",
                         close_reason="market_price_unavailable",
+                        holding_minutes=holding_minutes,
+                    )
+                )
+                continue
+
+            if resolution is not None:
+                close_reason = f"market_resolved:{resolution.outcome_label}"
+                close_result = await self.close_position(
+                    position_id=position.id,
+                    exit_price=current_price,
+                    close_reason=close_reason,
+                    holding_minutes=holding_minutes,
+                    current_price_delta=round(current_price - float(trade.entry_price), 4),
+                    resolution_outcome=resolution.outcome_label,
+                    resolved_at=resolution.resolved_at,
+                )
+                closed_trade_ids.append(close_result.trade_id)
+                closed_results.append(close_result)
+                decisions.append(
+                    PaperTradeAutoCloseDecision(
+                        **base_decision,
+                        trade_id=close_result.trade_id,
+                        action="CLOSED",
+                        close_reason=close_reason,
+                        current_price=current_price,
+                        current_price_delta=round(current_price - float(trade.entry_price), 4),
+                        holding_minutes=holding_minutes,
+                    )
+                )
+                continue
+
+            if not auto_close_enabled:
+                decisions.append(
+                    PaperTradeAutoCloseDecision(
+                        **base_decision,
+                        trade_id=trade.id,
+                        action="HELD",
+                        close_reason="auto_close_disabled",
+                        current_price=current_price,
+                        current_price_delta=round(current_price - float(trade.entry_price), 4),
                         holding_minutes=holding_minutes,
                     )
                 )
@@ -790,6 +865,9 @@ class PaperTrader:
                 error=decision.error,
             )
 
+        observation_sync = await self.sync_resolved_signal_observations(
+            signal_statuses=[SignalStatus.ACTIONABLE]
+        )
         result = PaperTradeMaintenanceResult(
             evaluated_positions=len(open_positions),
             closed_positions=len(closed_trade_ids),
@@ -797,6 +875,7 @@ class PaperTrader:
             closed_trade_ids=closed_trade_ids,
             closed_results=closed_results,
             decisions=decisions,
+            observation_sync=observation_sync,
         )
         log_event(
             logger,
@@ -805,6 +884,83 @@ class PaperTrader:
             closed_positions=result.closed_positions,
             skipped_positions=result.skipped_positions,
             closed_trade_ids=result.closed_trade_ids,
+            observation_sync_evaluated_signals=observation_sync.evaluated_signals,
+            observation_sync_synced_observations=observation_sync.synced_observations,
+            observation_sync_unresolved_signals=observation_sync.unresolved_signals,
+            observation_sync_skipped_signals=observation_sync.skipped_signals,
+        )
+        return result
+
+    async def sync_resolved_signal_observations(
+        self,
+        *,
+        signal_statuses: list[SignalStatus] | None = None,
+    ) -> ForecastObservationSyncResult:
+        """Persist resolved outcomes for signals even when no paper trade was opened."""
+        signals = await self.signal_repository.list_without_observation(
+            signal_statuses=signal_statuses,
+        )
+        result = ForecastObservationSyncResult(evaluated_signals=len(signals))
+        if not signals:
+            return result
+
+        market_ids = sorted({signal.market_id for signal in signals})
+        markets = await asyncio.gather(
+            *[self.market_client.fetch_market(market_id) for market_id in market_ids]
+        )
+        resolution_map = {
+            market_id: resolution
+            for market_id, market in zip(market_ids, markets, strict=False)
+            if market is not None
+            if (resolution := resolve_market_resolution(market)) is not None
+        }
+
+        for signal in signals:
+            analysis = signal.analysis
+            if analysis is None or analysis.direction == VerdictDirection.NONE:
+                result.skipped_signals += 1
+                continue
+
+            resolution = resolution_map.get(signal.market_id)
+            if resolution is None:
+                result.unresolved_signals += 1
+                continue
+
+            outcome_value = self._select_outcome_value_for_direction(
+                direction=analysis.direction.value,
+                yes_outcome_value=resolution.yes_outcome_value,
+            )
+            await self.forecast_observation_repository.upsert_for_signal(
+                signal_id=signal.id,
+                analysis_id=analysis.id,
+                position_id=None,
+                market_id=signal.market_id,
+                provider=self._select_provider(analysis),
+                model=self._select_model(analysis),
+                side=analysis.direction.value,
+                raw_probability=self._select_raw_probability(signal),
+                calibrated_probability=float(signal.fair_probability),
+                market_price=float(signal.market_price),
+                execution_price=self._select_execution_price(signal),
+                outcome_value=outcome_value,
+                outcome_label=resolution.outcome_label,
+                brier_score=calculate_brier_score(
+                    probability=float(signal.fair_probability),
+                    outcome_value=outcome_value,
+                ),
+                resolved_at=resolution.resolved_at,
+            )
+            result.synced_observations += 1
+            result.synced_signal_ids.append(signal.id)
+
+        log_event(
+            logger,
+            "forecast_observation_sync_completed",
+            evaluated_signals=result.evaluated_signals,
+            synced_observations=result.synced_observations,
+            unresolved_signals=result.unresolved_signals,
+            skipped_signals=result.skipped_signals,
+            synced_signal_ids=result.synced_signal_ids,
         )
         return result
 
@@ -876,6 +1032,44 @@ class PaperTrader:
             return MarketSide.NO
         raise PaperTraderError("Cannot open a paper trade when direction=NONE.")
 
+    def _select_raw_probability(self, signal) -> float:
+        raw_probability = signal.raw_fair_probability
+        if raw_probability is None:
+            raw_probability = signal.fair_probability
+        return float(raw_probability)
+
+    def _select_execution_price(self, signal) -> float:
+        execution_price = signal.execution_price
+        if execution_price is None:
+            execution_price = signal.market_price
+        return float(execution_price)
+
+    def _select_provider(self, analysis) -> str | None:
+        raw_response = analysis.raw_response or {}
+        if analysis.llm_provider is not None:
+            return analysis.llm_provider
+        provider = raw_response.get("provider")
+        return str(provider) if provider is not None else None
+
+    def _select_model(self, analysis) -> str | None:
+        raw_response = analysis.raw_response or {}
+        if analysis.llm_model is not None:
+            return analysis.llm_model
+        model = raw_response.get("model")
+        return str(model) if model is not None else None
+
+    def _select_outcome_value_for_direction(
+        self,
+        *,
+        direction: str,
+        yes_outcome_value: float,
+    ) -> float:
+        if direction == VerdictDirection.YES.value:
+            return round(yes_outcome_value, 4)
+        if direction == VerdictDirection.NO.value:
+            return round(1 - yes_outcome_value, 4)
+        raise PaperTraderError(f"Unsupported direction for forecast observation sync: {direction}")
+
 
 async def open_paper_position(
     session: AsyncSession,
@@ -890,6 +1084,7 @@ async def open_paper_position(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        forecast_observation_repository=ForecastObservationRepository(session),
         runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
@@ -909,6 +1104,7 @@ async def close_paper_position(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        forecast_observation_repository=ForecastObservationRepository(session),
         runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
@@ -928,6 +1124,7 @@ async def get_paper_trade_stats(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        forecast_observation_repository=ForecastObservationRepository(session),
         runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
@@ -946,6 +1143,7 @@ async def get_paper_trade_analytics(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        forecast_observation_repository=ForecastObservationRepository(session),
         runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )
@@ -962,6 +1160,7 @@ async def run_paper_trade_maintenance(
         signal_repository=SignalRepository(session),
         analysis_repository=AnalysisRepository(session),
         trade_repository=TradeRepository(session),
+        forecast_observation_repository=ForecastObservationRepository(session),
         runtime_flag_repository=RuntimeFlagRepository(session),
         market_client=build_market_client(settings),
     )

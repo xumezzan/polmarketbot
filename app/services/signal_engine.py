@@ -11,9 +11,16 @@ from app.logging_utils import configure_logging, log_event
 from app.models.analysis import Analysis
 from app.models.enums import SignalStatus, VerdictDirection
 from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.forecast_observation_repo import ForecastObservationRepository
 from app.repositories.signal_repo import SignalRepository
 from app.schemas.market import MarketCandidate
 from app.schemas.signal import SignalEvaluation, SignalRunResult
+from app.services.forecasting import (
+    EdgeEstimate,
+    CalibrationPoint,
+    build_execution_edge,
+    calibrate_probability,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -32,10 +39,12 @@ class SignalEngine:
         settings: Settings,
         analysis_repository: AnalysisRepository,
         signal_repository: SignalRepository,
+        forecast_observation_repository: ForecastObservationRepository,
     ) -> None:
         self.settings = settings
         self.analysis_repository = analysis_repository
         self.signal_repository = signal_repository
+        self.forecast_observation_repository = forecast_observation_repository
 
     async def run(self, analysis_id: int | None = None) -> SignalRunResult:
         analysis = await self._load_analysis(analysis_id)
@@ -100,13 +109,44 @@ class SignalEngine:
         candidate: MarketCandidate,
     ) -> SignalEvaluation:
         market_price = self._select_market_price(analysis=analysis, candidate=candidate)
-        fair_probability = float(analysis.fair_probability)
-        edge = round(fair_probability - market_price, 4)
+        raw_probability = float(analysis.fair_probability)
+        calibration_result = await self._calibrate_probability(
+            analysis=analysis,
+            raw_probability=raw_probability,
+        )
+        if analysis.direction == VerdictDirection.NONE:
+            edge_estimate = EdgeEstimate(
+                reference_market_price=round(market_price, 4),
+                execution_price=round(market_price, 4),
+                raw_probability=round(raw_probability, 4),
+                calibrated_probability=round(calibration_result.calibrated_probability, 4),
+                raw_edge=round(raw_probability - market_price, 4),
+                net_edge=round(calibration_result.calibrated_probability - market_price, 4),
+                estimated_fee_rate=0.0,
+                estimated_fee_per_share=0.0,
+                market_consensus_weight=0.0,
+            )
+        else:
+            edge_estimate = build_execution_edge(
+                settings=self.settings,
+                direction=analysis.direction.value,
+                candidate=candidate,
+                reference_market_price=market_price,
+                raw_probability=raw_probability,
+                calibrated_probability=calibration_result.calibrated_probability,
+            )
         status, explanation = self._classify_signal(
             analysis=analysis,
             candidate=candidate,
             market_price=market_price,
-            edge=edge,
+            execution_price=edge_estimate.execution_price,
+            raw_edge=edge_estimate.raw_edge,
+            edge=edge_estimate.net_edge,
+            fair_probability=edge_estimate.calibrated_probability,
+            raw_probability=raw_probability,
+            calibration_sample_count=calibration_result.sample_count,
+            estimated_fee_per_share=edge_estimate.estimated_fee_per_share,
+            market_consensus_weight=edge_estimate.market_consensus_weight,
         )
 
         signal = await self.signal_repository.upsert(
@@ -115,8 +155,15 @@ class SignalEngine:
             market_slug=candidate.slug,
             market_question=candidate.question,
             market_price=market_price,
-            fair_probability=fair_probability,
-            edge=edge,
+            execution_price=edge_estimate.execution_price,
+            raw_fair_probability=raw_probability,
+            fair_probability=edge_estimate.calibrated_probability,
+            raw_edge=edge_estimate.raw_edge,
+            edge=edge_estimate.net_edge,
+            estimated_fee_rate=edge_estimate.estimated_fee_rate,
+            estimated_fee_per_share=edge_estimate.estimated_fee_per_share,
+            market_consensus_weight=edge_estimate.market_consensus_weight,
+            calibration_sample_count=calibration_result.sample_count,
             signal_status=status,
             explanation=explanation,
         )
@@ -129,7 +176,7 @@ class SignalEngine:
             news_item_id=analysis.news_item_id,
             market_id=candidate.market_id,
             signal_status=status.value,
-            edge=edge,
+            edge=edge_estimate.net_edge,
         )
 
         return SignalEvaluation(
@@ -140,11 +187,42 @@ class SignalEngine:
             market_question=candidate.question,
             direction=analysis.direction.value,
             market_price=market_price,
-            fair_probability=fair_probability,
-            edge=edge,
+            execution_price=edge_estimate.execution_price,
+            raw_fair_probability=raw_probability,
+            fair_probability=edge_estimate.calibrated_probability,
+            raw_edge=edge_estimate.raw_edge,
+            edge=edge_estimate.net_edge,
+            estimated_fee_rate=edge_estimate.estimated_fee_rate,
+            estimated_fee_per_share=edge_estimate.estimated_fee_per_share,
+            market_consensus_weight=edge_estimate.market_consensus_weight,
+            calibration_sample_count=calibration_result.sample_count,
             signal_status=status.value,
             explanation=explanation,
             candidate=candidate,
+        )
+
+    async def _calibrate_probability(
+        self,
+        *,
+        analysis: Analysis,
+        raw_probability: float,
+    ):
+        raw_response = analysis.raw_response or {}
+        history = await self.forecast_observation_repository.list_for_provider_model(
+            provider=str(raw_response.get("provider")) if analysis.llm_provider is None and raw_response.get("provider") is not None else analysis.llm_provider,
+            model=str(raw_response.get("model")) if analysis.llm_model is None and raw_response.get("model") is not None else analysis.llm_model,
+        )
+        points = [
+            CalibrationPoint(
+                raw_probability=float(item.raw_probability),
+                outcome_value=float(item.outcome_value),
+            )
+            for item in history
+        ]
+        return calibrate_probability(
+            settings=self.settings,
+            raw_probability=raw_probability,
+            history=points,
         )
 
     async def _load_analysis(self, analysis_id: int | None) -> Analysis | None:
@@ -195,19 +273,26 @@ class SignalEngine:
         analysis: Analysis,
         candidate: MarketCandidate,
         market_price: float,
+        execution_price: float,
+        raw_edge: float,
         edge: float,
+        fair_probability: float,
+        raw_probability: float,
+        calibration_sample_count: int,
+        estimated_fee_per_share: float,
+        market_consensus_weight: float,
     ) -> tuple[SignalStatus, str]:
         relevance = float(analysis.relevance)
         confidence = float(analysis.confidence)
-        fair_probability = float(analysis.fair_probability)
         direction = analysis.direction
 
         if direction == VerdictDirection.NONE:
             return (
                 SignalStatus.REJECTED,
                 (
-                    f"Rejected because direction=NONE. fair_probability={fair_probability:.4f}, "
-                    f"reference_market_price={market_price:.4f}, edge={edge:.4f}."
+                    f"Rejected because direction=NONE. raw_probability={raw_probability:.4f}, "
+                    f"calibrated_probability={fair_probability:.4f}, "
+                    f"reference_market_price={market_price:.4f}, net_edge={edge:.4f}."
                 ),
             )
 
@@ -219,9 +304,15 @@ class SignalEngine:
             return (
                 SignalStatus.ACTIONABLE,
                 (
-                    f"Actionable: edge={edge:.4f} exceeds {self.settings.signal_actionable_edge_threshold:.4f}, "
+                    f"Actionable: net_edge={edge:.4f} exceeds "
+                    f"{self.settings.signal_actionable_edge_threshold:.4f}, "
                     f"confidence={confidence:.4f}, relevance={relevance:.4f}, "
-                    f"market_price={market_price:.4f}, fair_probability={fair_probability:.4f}, "
+                    f"market_price={market_price:.4f}, execution_price={execution_price:.4f}, "
+                    f"raw_probability={raw_probability:.4f}, "
+                    f"calibrated_probability={fair_probability:.4f}, "
+                    f"raw_edge={raw_edge:.4f}, fee_per_share={estimated_fee_per_share:.6f}, "
+                    f"consensus_weight={market_consensus_weight:.4f}, "
+                    f"calibration_samples={calibration_sample_count}, "
                     f"match_score={candidate.match_score:.4f}."
                 ),
             )
@@ -230,18 +321,22 @@ class SignalEngine:
             return (
                 SignalStatus.WATCHLIST,
                 (
-                    f"Watchlist: positive edge={edge:.4f}, but actionable thresholds were not all met. "
+                    f"Watchlist: positive net_edge={edge:.4f}, but actionable thresholds were not all met. "
                     f"confidence={confidence:.4f}, relevance={relevance:.4f}, "
-                    f"market_price={market_price:.4f}, fair_probability={fair_probability:.4f}."
+                    f"market_price={market_price:.4f}, execution_price={execution_price:.4f}, "
+                    f"raw_probability={raw_probability:.4f}, "
+                    f"calibrated_probability={fair_probability:.4f}, raw_edge={raw_edge:.4f}."
                 ),
             )
 
         return (
             SignalStatus.REJECTED,
             (
-                f"Rejected: edge={edge:.4f} is not above watchlist threshold "
+                f"Rejected: net_edge={edge:.4f} is not above watchlist threshold "
                 f"{self.settings.signal_watchlist_edge_threshold:.4f}. "
-                f"market_price={market_price:.4f}, fair_probability={fair_probability:.4f}, "
+                f"market_price={market_price:.4f}, execution_price={execution_price:.4f}, "
+                f"raw_probability={raw_probability:.4f}, "
+                f"calibrated_probability={fair_probability:.4f}, raw_edge={raw_edge:.4f}, "
                 f"confidence={confidence:.4f}, relevance={relevance:.4f}."
             ),
         )
@@ -291,6 +386,7 @@ async def run_signal_engine(
         settings=settings,
         analysis_repository=AnalysisRepository(session),
         signal_repository=SignalRepository(session),
+        forecast_observation_repository=ForecastObservationRepository(session),
     )
     return await engine.run(analysis_id=analysis_id)
 
