@@ -89,7 +89,7 @@ class NewsRepository:
         stmt = sa.select(NewsItem).order_by(NewsItem.id.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def list_without_analysis(self, *, limit: int) -> list[NewsItem]:
+    async def list_without_analysis(self, *, limit: int | None = None) -> list[NewsItem]:
         """Return news items that have not gone through LLM analysis yet."""
         analysis_exists = (
             sa.select(sa.literal(1))
@@ -99,7 +99,8 @@ class NewsRepository:
         stmt = (
             sa.select(NewsItem)
             .where(~sa.exists(analysis_exists))
-            .order_by(NewsItem.id.asc())
-            .limit(limit)
+            .order_by(NewsItem.published_at.desc().nullslast(), NewsItem.id.desc())
         )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())

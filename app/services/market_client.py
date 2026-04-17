@@ -40,6 +40,112 @@ STOPWORDS = {
     "will",
 }
 
+QUERY_FILLER_TOKENS = {
+    "approval",
+    "approve",
+    "approved",
+    "called",
+    "every",
+    "exchange",
+    "forecast",
+    "implications",
+    "impact",
+    "increase",
+    "indicator",
+    "operations",
+    "prediction",
+    "price",
+    "reach",
+    "resistance",
+    "signal",
+    "simple",
+    "since",
+    "status",
+    "target",
+    "transaction",
+    "upgrades",
+    "volume",
+}
+
+ASSET_DOMAIN_ALIASES = {
+    "bitcoin": {"bitcoin", "btc"},
+    "ethereum": {"ethereum", "eth", "ether"},
+    "xrp": {"xrp", "ripple"},
+    "solana": {"solana", "sol"},
+    "dogecoin": {"dogecoin", "doge"},
+    "cardano": {"cardano", "ada"},
+}
+
+MACRO_DOMAIN_TOKENS = {
+    "fed",
+    "federal",
+    "reserve",
+    "powell",
+    "rate",
+    "rates",
+    "fomc",
+    "inflation",
+    "cpi",
+    "recession",
+    "tariff",
+    "economy",
+}
+
+CRYPTO_DOMAIN_TOKENS = {
+    "crypto",
+    "bitcoin",
+    "btc",
+    "ethereum",
+    "eth",
+    "ether",
+    "xrp",
+    "ripple",
+    "solana",
+    "sol",
+    "doge",
+    "dogecoin",
+    "cardano",
+    "ada",
+    "stablecoin",
+    "stablecoins",
+    "etf",
+    "etfs",
+    "token",
+    "tokens",
+    "blockchain",
+    "exchange",
+    "sec",
+    "cftc",
+    "clarity",
+}
+
+GENERIC_DOMAIN_TOKENS = {
+    "all",
+    "time",
+    "high",
+    "low",
+    "new",
+    "year",
+    "month",
+    "quarter",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "status",
+    "operations",
+    "approval",
+    "target",
+}
+
 
 class MarketClientError(Exception):
     """Raised when market fetching or matching fails."""
@@ -354,8 +460,9 @@ class KeywordMarketRanker:
         analysis: Analysis,
         markets: list[GammaMarket],
     ) -> list[MarketCandidate]:
-        query_tokens = _tokenize(analysis.market_query)
-        query_phrase = analysis.market_query.strip().lower()
+        query_text = normalize_market_query(analysis.market_query)
+        query_tokens = _tokenize(query_text)
+        query_phrase = query_text.strip().lower()
 
         ranked: list[MarketCandidate] = []
         for market in markets:
@@ -506,14 +613,20 @@ class MarketMatchingService:
             raise MarketClientError("No analysis found to match against Polymarket.")
 
         markets = await self.client.fetch_markets()
-        ranked_candidates = self.ranker.rank(analysis=analysis, markets=markets)
+        normalized_query = normalize_market_query(analysis.market_query)
+        domain_anchor_tokens = extract_market_domain_anchor_tokens(normalized_query)
+        filtered_markets = filter_markets_by_query_domain(
+            markets=markets,
+            query_text=normalized_query,
+        )
+        ranked_candidates = self.ranker.rank(analysis=analysis, markets=filtered_markets)
         filtered_candidates = self.correlation_filter.apply(ranked_candidates)
         top_candidates = filtered_candidates[: self.settings.market_top_n]
 
         result = MarketMatchResult(
             analysis_id=analysis.id,
             news_item_id=analysis.news_item_id,
-            market_query=analysis.market_query,
+            market_query=normalized_query,
             fetch_mode=self.settings.market_fetch_mode.lower(),
             match_strategy=self.settings.market_match_strategy.lower(),
             fetched_count=len(markets),
@@ -527,7 +640,12 @@ class MarketMatchingService:
                 "generated_at": datetime.now(UTC).isoformat(),
                 "fetch_mode": result.fetch_mode,
                 "match_strategy": result.match_strategy,
+                "raw_market_query": analysis.market_query,
+                "normalized_market_query": result.market_query,
                 "fetched_count": result.fetched_count,
+                "domain_filter_applied": bool(domain_anchor_tokens),
+                "domain_anchor_tokens": sorted(domain_anchor_tokens),
+                "domain_filtered_count": len(filtered_markets),
                 "candidate_count": result.candidate_count,
                 "candidates": [candidate.model_dump(mode="json") for candidate in top_candidates],
             },
@@ -539,6 +657,7 @@ class MarketMatchingService:
             analysis_id=analysis.id,
             news_item_id=analysis.news_item_id,
             fetched_count=result.fetched_count,
+            domain_filtered_count=len(filtered_markets),
             candidate_count=result.candidate_count,
             market_query=result.market_query,
         )
@@ -596,6 +715,160 @@ async def run_market_matching(
 def _tokenize(value: str) -> set[str]:
     tokens = re.findall(r"[a-z0-9]+", value.lower())
     return {token for token in tokens if token not in STOPWORDS and len(token) > 1}
+
+
+def filter_markets_by_query_domain(
+    *,
+    markets: list[GammaMarket],
+    query_text: str,
+) -> list[GammaMarket]:
+    """Reduce the candidate universe to markets in the same domain as the query."""
+    anchor_tokens = extract_market_domain_anchor_tokens(query_text)
+    if not anchor_tokens:
+        return markets
+
+    filtered = [
+        market
+        for market in markets
+        if _market_domain_tokens(market) & anchor_tokens
+    ]
+    return filtered
+
+
+def extract_market_domain_anchor_tokens(query_text: str) -> set[str]:
+    """Return high-signal domain tokens used to prefilter Polymarket markets."""
+    lowered = (query_text or "").strip().lower()
+    if not lowered or lowered == "general news":
+        return set()
+
+    anchor_tokens: set[str] = set()
+    asset = _detect_primary_asset(lowered)
+    if asset is not None:
+        anchor_tokens |= ASSET_DOMAIN_ALIASES.get(asset, {asset})
+
+    if any(token in lowered for token in ("fed", "federal reserve", "powell", "rate cut")):
+        anchor_tokens |= MACRO_DOMAIN_TOKENS
+
+    if any(token in lowered for token in ("clarity", "crypto", "exchange", "stablecoin", "etf")):
+        anchor_tokens |= CRYPTO_DOMAIN_TOKENS
+
+    if anchor_tokens:
+        return anchor_tokens
+
+    fallback_tokens = [
+        token
+        for token in _normalized_query_tokens(lowered)
+        if token not in GENERIC_DOMAIN_TOKENS
+    ]
+    return set(fallback_tokens[:2])
+
+
+def normalize_market_query(value: str) -> str:
+    """Reduce free-form LLM output to a tighter market-search query."""
+    raw = (value or "").strip()
+    if not raw:
+        return raw
+
+    lowered = raw.lower()
+    asset = _detect_primary_asset(lowered)
+    price_target = _extract_price_target(lowered)
+
+    if asset and ("all-time high" in lowered or "all time high" in lowered):
+        return f"{asset} all time high"
+
+    if asset and price_target is not None:
+        return f"{asset} {price_target}"
+
+    if asset and "government" in lowered and ("seizure" in lowered or "moves" in lowered):
+        return f"{asset} government transfer"
+
+    if asset and "tax" in lowered:
+        return f"{asset} tax"
+
+    if asset and "quantum" in lowered:
+        return f"{asset} quantum"
+
+    if asset and ("transaction volume" in lowered or "volume" in lowered):
+        return f"{asset} volume"
+
+    if "clarity act" in lowered:
+        return "clarity act crypto"
+
+    if "grinex" in lowered:
+        return "grinex exchange"
+
+    tokens = _normalized_query_tokens(lowered)
+    if asset and asset not in tokens:
+        tokens.insert(0, asset)
+
+    if not tokens:
+        return raw
+
+    return " ".join(tokens[:4])
+
+
+def _detect_primary_asset(value: str) -> str | None:
+    if any(token in value for token in ("bitcoin", " btc", "btc ", "btc-", "btc/")):
+        return "bitcoin"
+    if any(token in value for token in ("ethereum", " ether", "eth ", "eth-", "eth/")):
+        return "ethereum"
+    if "xrp" in value:
+        return "xrp"
+    return None
+
+
+def _extract_price_target(value: str) -> str | None:
+    million_match = re.search(r"(\d+(?:\.\d+)?)\s*m\b", value)
+    if million_match:
+        number = million_match.group(1).rstrip("0").rstrip(".")
+        return f"{number}m"
+
+    thousand_match = re.search(r"\$?\s*(\d{2,3})(?:[,\s]?(\d{3}))\b", value)
+    if thousand_match and thousand_match.group(2):
+        return f"{thousand_match.group(1)}k"
+
+    compact_thousand_match = re.search(r"(\d{2,3})\s*k\b", value)
+    if compact_thousand_match:
+        return f"{compact_thousand_match.group(1)}k"
+
+    return None
+
+
+def _normalized_query_tokens(value: str) -> list[str]:
+    alias_map = {
+        "btc": "bitcoin",
+        "eth": "ethereum",
+    }
+    raw_tokens = re.findall(r"[a-z0-9]+", value.lower())
+    tokens: list[str] = []
+
+    for token in raw_tokens:
+        mapped = alias_map.get(token, token)
+        if mapped in STOPWORDS or mapped in QUERY_FILLER_TOKENS:
+            continue
+        if re.fullmatch(r"20\d{2}", mapped):
+            continue
+        if len(mapped) <= 1:
+            continue
+        if mapped not in tokens:
+            tokens.append(mapped)
+
+    return tokens
+
+
+def _market_domain_tokens(market: GammaMarket) -> set[str]:
+    text = " ".join(
+        part
+        for part in (
+            market.question,
+            market.slug or "",
+            market.event_title or "",
+            market.event_slug or "",
+            market.description or "",
+        )
+        if part
+    )
+    return _tokenize(text)
 
 
 def _token_overlap(query_tokens: set[str], document_tokens: set[str]) -> float:

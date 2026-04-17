@@ -1,4 +1,9 @@
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
 from app.scheduler import build_skipped_ingestion_result, should_run_news_ingestion
+from app.scheduler import select_pending_news_for_cycle
+from tests.helpers import build_test_settings
 
 
 def test_scheduler_runs_news_ingestion_every_cycle_by_default() -> None:
@@ -37,3 +42,46 @@ def test_build_skipped_ingestion_result_returns_zeroed_payload() -> None:
     assert result.inserted_count == 0
     assert result.skipped_count == 0
     assert result.filtered_out_count == 0
+
+
+def test_select_pending_news_for_cycle_prefers_newest_fresh_items() -> None:
+    now = datetime(2026, 4, 17, 12, 0, tzinfo=UTC)
+    settings = build_test_settings(
+        scheduler_news_batch_limit=2,
+        risk_max_news_age_minutes=360,
+    )
+    items = [
+        SimpleNamespace(id=1, published_at=now - timedelta(minutes=720)),
+        SimpleNamespace(id=2, published_at=now - timedelta(minutes=15)),
+        SimpleNamespace(id=3, published_at=now - timedelta(minutes=45)),
+    ]
+
+    selected, stale = select_pending_news_for_cycle(
+        items=items,
+        settings=settings,
+        now=now,
+    )
+
+    assert [item.id for item in selected] == [2, 3]
+    assert [item.id for item in stale] == [1]
+
+
+def test_select_pending_news_for_cycle_keeps_unknown_timestamps() -> None:
+    now = datetime(2026, 4, 17, 12, 0, tzinfo=UTC)
+    settings = build_test_settings(
+        scheduler_news_batch_limit=2,
+        risk_max_news_age_minutes=360,
+    )
+    items = [
+        SimpleNamespace(id=1, published_at=None),
+        SimpleNamespace(id=2, published_at=now - timedelta(minutes=10)),
+    ]
+
+    selected, stale = select_pending_news_for_cycle(
+        items=items,
+        settings=settings,
+        now=now,
+    )
+
+    assert [item.id for item in selected] == [1, 2]
+    assert stale == []

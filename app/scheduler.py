@@ -2,12 +2,14 @@ import argparse
 import asyncio
 import logging
 from datetime import UTC, datetime
+from typing import Iterable
 
 import sqlalchemy as sa
 
 from app.config import Settings, get_settings
 from app.database import AsyncSessionLocal, engine
 from app.logging_utils import configure_logging, log_event
+from app.models.news import NewsItem
 from app.models.enums import SignalStatus
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
@@ -24,7 +26,7 @@ from app.services.paper_trader import (
     open_paper_position,
     run_paper_trade_maintenance,
 )
-from app.services.risk_engine import run_risk_engine
+from app.services.risk_engine import resolve_news_age_limit_minutes, run_risk_engine
 from app.services.signal_engine import run_signal_engine
 
 
@@ -37,6 +39,44 @@ class SchedulerError(Exception):
 
 class SchedulerLockNotAcquired(Exception):
     """Raised when another scheduler instance already holds the advisory lock."""
+
+
+def _news_age_minutes(
+    *,
+    published_at: datetime | None,
+    now: datetime,
+) -> int | None:
+    if published_at is None:
+        return None
+
+    published = published_at
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=UTC)
+
+    return int(max((now - published).total_seconds(), 0.0) // 60)
+
+
+def select_pending_news_for_cycle(
+    *,
+    items: Iterable[NewsItem],
+    settings: Settings,
+    now: datetime,
+) -> tuple[list[NewsItem], list[NewsItem]]:
+    freshness_limit = resolve_news_age_limit_minutes(settings)
+    selected: list[NewsItem] = []
+    stale: list[NewsItem] = []
+
+    for item in items:
+        age_minutes = _news_age_minutes(published_at=item.published_at, now=now)
+        if age_minutes is not None and age_minutes > freshness_limit:
+            stale.append(item)
+            continue
+
+        selected.append(item)
+        if len(selected) >= settings.scheduler_news_batch_limit:
+            break
+
+    return selected, stale
 
 
 class PipelineScheduler:
@@ -118,9 +158,21 @@ class PipelineScheduler:
                         cycle_number=cycle_number,
                         every_n_cycles=self.settings.scheduler_news_fetch_every_n_cycles,
                     )
-                pending_news = await NewsRepository(session).list_without_analysis(
-                    limit=self.settings.scheduler_news_batch_limit
+                pending_candidates = await NewsRepository(session).list_without_analysis()
+                pending_news, stale_pending_news = select_pending_news_for_cycle(
+                    items=pending_candidates,
+                    settings=self.settings,
+                    now=started_at,
                 )
+                if stale_pending_news:
+                    log_event(
+                        logger,
+                        "scheduler_stale_pending_news_skipped",
+                        cycle_id=cycle_id,
+                        stale_count=len(stale_pending_news),
+                        stale_news_item_ids=[item.id for item in stale_pending_news[:20]],
+                        freshness_limit_minutes=resolve_news_age_limit_minutes(self.settings),
+                    )
 
                 item_results: list[PipelineItemResult] = []
                 actionable_signal_count = 0
