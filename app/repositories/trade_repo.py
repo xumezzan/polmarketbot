@@ -120,6 +120,35 @@ class TradeRepository:
         stmt = self._trade_with_context().order_by(PaperTrade.id.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())
 
+    async def list_recent_closed_trades(self, *, limit: int = 10) -> list[PaperTrade]:
+        """Return latest closed paper trades with context."""
+        stmt = (
+            self._trade_with_context()
+            .where(PaperTrade.status == TradeStatus.CLOSED)
+            .order_by(PaperTrade.closed_at.desc().nullslast(), PaperTrade.id.desc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_top_closed_trades(
+        self,
+        *,
+        limit: int = 5,
+        descending: bool = True,
+    ) -> list[PaperTrade]:
+        """Return best or worst closed trades by realized PnL."""
+        order_column = PaperTrade.pnl.desc() if descending else PaperTrade.pnl.asc()
+        stmt = (
+            self._trade_with_context()
+            .where(
+                PaperTrade.status == TradeStatus.CLOSED,
+                PaperTrade.pnl.is_not(None),
+            )
+            .order_by(order_column, PaperTrade.closed_at.desc().nullslast(), PaperTrade.id.desc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def count_open_positions(self) -> int:
         """Return the current number of open paper positions."""
         stmt = sa.select(sa.func.count()).select_from(Position).where(
