@@ -10,6 +10,18 @@ from app.services.news_fetcher import NewsApiClient
 from tests.helpers import build_test_settings
 
 
+class _FakeRuntimeFlagRepository:
+    def __init__(self) -> None:
+        self.values: dict[str, str | None] = {}
+
+    async def get_text(self, *, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set_text(self, *, key: str, value: str | None):
+        self.values[key] = value
+        return None
+
+
 @pytest.mark.asyncio
 async def test_openai_llm_client_parses_structured_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
@@ -290,7 +302,8 @@ async def test_news_api_client_retries_rate_limit_then_succeeds(
             news_api_key="test-news-key",
             news_retry_max_attempts=2,
             news_retry_base_delay_seconds=0,
-        )
+        ),
+        runtime_flag_repository=_FakeRuntimeFlagRepository(),
     )
     articles = await client.fetch_latest()
 

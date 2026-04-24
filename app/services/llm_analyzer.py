@@ -92,6 +92,10 @@ class LLMAnalysisError(Exception):
     """Raised when the LLM analysis step fails."""
 
 
+class LLMAuthenticationError(LLMAnalysisError):
+    """Raised when OpenAI authentication or configuration is invalid."""
+
+
 class LLMClientProtocol(Protocol):
     """Interface for a structured verdict provider."""
 
@@ -226,9 +230,9 @@ class OpenAILLMClient:
 
     def __init__(self, settings: Settings) -> None:
         if not settings.openai_api_key:
-            raise LLMAnalysisError("OPENAI_API_KEY is required when LLM_MODE=openai")
+            raise LLMAuthenticationError("OPENAI_API_KEY is required when LLM_MODE=openai")
         if AsyncOpenAI is None:
-            raise LLMAnalysisError("openai package is required when LLM_MODE=openai")
+            raise LLMAuthenticationError("openai package is required when LLM_MODE=openai")
 
         self.settings = settings
         self.client = AsyncOpenAI(
@@ -287,6 +291,8 @@ class OpenAILLMClient:
                 request_id=request_id,
                 status_code=status_code,
             )
+            if status_code in {401, 403}:
+                raise LLMAuthenticationError(f"OpenAI authentication failed: {exc}") from exc
             raise LLMAnalysisError(f"OpenAI analysis failed: {exc}") from exc
 
         message = completion.choices[0].message
@@ -343,6 +349,56 @@ def _is_retryable_openai_exception(exc: Exception) -> bool:
     return False
 
 
+class FallbackLLMClient:
+    """Use OpenAI when available and fall back to stub analysis on auth/config errors."""
+
+    def __init__(
+        self,
+        *,
+        primary: LLMClientProtocol | None,
+        fallback: LLMClientProtocol,
+        primary_provider: str,
+        initial_error: Exception | None = None,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.primary_provider = primary_provider
+        self.initial_error = initial_error
+
+    async def analyze_news_item(self, news_item: NewsItem) -> tuple[Verdict, dict[str, object] | None]:
+        if self.primary is None:
+            return await self._run_fallback(news_item=news_item, reason=str(self.initial_error))
+
+        try:
+            return await self.primary.analyze_news_item(news_item)
+        except LLMAuthenticationError as exc:
+            return await self._run_fallback(news_item=news_item, reason=str(exc))
+
+    async def _run_fallback(
+        self,
+        *,
+        news_item: NewsItem,
+        reason: str,
+    ) -> tuple[Verdict, dict[str, object] | None]:
+        log_event(
+            logger,
+            "llm_fallback_activated",
+            news_item_id=news_item.id,
+            primary_provider=self.primary_provider,
+            fallback_provider="stub",
+            reason=reason,
+        )
+        verdict, raw_response = await self.fallback.analyze_news_item(news_item)
+        payload = dict(raw_response or {})
+        payload["fallback"] = {
+            "from_provider": self.primary_provider,
+            "to_provider": "stub",
+            "reason": reason,
+            "activated_at": datetime.now(UTC).isoformat(),
+        }
+        return verdict, payload
+
+
 def build_llm_client(settings: Settings) -> LLMClientProtocol:
     """Return either a stub analyzer or the real OpenAI client."""
     mode = settings.llm_mode.lower()
@@ -351,7 +407,33 @@ def build_llm_client(settings: Settings) -> LLMClientProtocol:
         return StubLLMClient()
 
     if mode == "openai":
-        return OpenAILLMClient(settings)
+        fallback_mode = settings.llm_openai_fallback_mode.lower()
+        try:
+            primary = OpenAILLMClient(settings)
+        except LLMAuthenticationError as exc:
+            if fallback_mode == "stub":
+                log_event(
+                    logger,
+                    "llm_primary_client_unavailable",
+                    primary_provider="openai",
+                    fallback_provider="stub",
+                    reason=str(exc),
+                )
+                return FallbackLLMClient(
+                    primary=None,
+                    fallback=StubLLMClient(),
+                    primary_provider="openai",
+                    initial_error=exc,
+                )
+            raise
+
+        if fallback_mode == "stub":
+            return FallbackLLMClient(
+                primary=primary,
+                fallback=StubLLMClient(),
+                primary_provider="openai",
+            )
+        return primary
 
     raise ValueError("Unsupported LLM_MODE. Expected 'stub' or 'openai'.")
 

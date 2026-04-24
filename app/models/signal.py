@@ -8,6 +8,9 @@ from app.models.enums import SignalStatus
 
 if TYPE_CHECKING:
     from app.models.analysis import Analysis
+    from app.models.execution_intent import ExecutionIntent
+    from app.models.live_order import LiveOrder
+    from app.models.live_position import LivePosition
     from app.models.position import Position
     from app.models.trade import PaperTrade
 
@@ -54,5 +57,17 @@ class Signal(TimestampMixin, Base):
     explanation: Mapped[str] = mapped_column(sa.Text, nullable=False)
 
     analysis: Mapped["Analysis"] = relationship(back_populates="signals")
+    execution_intents: Mapped[list["ExecutionIntent"]] = relationship(
+        back_populates="signal",
+        cascade="all, delete-orphan",
+    )
+    live_orders: Mapped[list["LiveOrder"]] = relationship(
+        back_populates="signal",
+        cascade="all, delete-orphan",
+    )
+    live_positions: Mapped[list["LivePosition"]] = relationship(
+        back_populates="signal",
+        cascade="all, delete-orphan",
+    )
     paper_trades: Mapped[list["PaperTrade"]] = relationship(back_populates="signal")
     positions: Mapped[list["Position"]] = relationship(back_populates="signal")

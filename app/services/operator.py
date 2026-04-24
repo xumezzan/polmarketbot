@@ -4,24 +4,31 @@ from typing import Any
 
 from app.config import Settings
 from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.live_trade_repo import LiveTradeRepository
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
 from app.repositories.runtime_flag_repo import RuntimeFlagRepository
 from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
-from app.runtime_flags import RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH
+from app.runtime_flags import (
+    RUNTIME_FLAG_LIVE_CIRCUIT_BREAKER,
+    RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH,
+    RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH,
+)
 from app.schemas.admin import (
     AdminPaperStatsResponse,
     AdminStatusResponse,
     OpenPositionItem,
     OpenPositionsResponse,
+    ProofOfEdgeResponse,
     SignalAuditItem,
     SignalAuditResponse,
     RecentSignalItem,
     RecentSignalsResponse,
 )
 from app.schemas.trade import PaperTradeStats
+from app.services.proof_of_edge import ProofOfEdgeService
 
 
 def _to_iso(value: datetime | None) -> str | None:
@@ -97,6 +104,7 @@ class OperatorService:
         analysis_repository: AnalysisRepository,
         signal_repository: SignalRepository,
         trade_repository: TradeRepository,
+        live_trade_repository: LiveTradeRepository,
         runtime_flag_repository: RuntimeFlagRepository,
         operator_state_repository: OperatorStateRepository,
         scheduler_cycle_repository: SchedulerCycleRepository,
@@ -106,6 +114,7 @@ class OperatorService:
         self.analysis_repository = analysis_repository
         self.signal_repository = signal_repository
         self.trade_repository = trade_repository
+        self.live_trade_repository = live_trade_repository
         self.runtime_flag_repository = runtime_flag_repository
         self.operator_state_repository = operator_state_repository
         self.scheduler_cycle_repository = scheduler_cycle_repository
@@ -117,6 +126,14 @@ class OperatorService:
         operator_state = await self.operator_state_repository.get_or_create()
         kill_switch_enabled, _ = await self.runtime_flag_repository.get_status(
             key=RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH,
+            default=False,
+        )
+        live_kill_switch_enabled, _ = await self.runtime_flag_repository.get_status(
+            key=RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH,
+            default=False,
+        )
+        live_circuit_breaker_enabled, _ = await self.runtime_flag_repository.get_status(
+            key=RUNTIME_FLAG_LIVE_CIRCUIT_BREAKER,
             default=False,
         )
 
@@ -137,6 +154,8 @@ class OperatorService:
         signals_count_24h = await self.signal_repository.count_created_since(since=since)
         paper_trades_count = await self.trade_repository.count_trades()
         open_positions_count = await self.trade_repository.count_open_positions()
+        live_orders_count = await self.live_trade_repository.count_orders()
+        live_open_positions_count = await self.live_trade_repository.count_open_positions()
         opened_trades_24h = await self.trade_repository.count_opened_trades_since(since=since)
         closed_trades_24h = await self.trade_repository.count_closed_trades_since(since=since)
 
@@ -154,7 +173,13 @@ class OperatorService:
             signals_count=signals_count,
             paper_trades_count=paper_trades_count,
             open_positions_count=open_positions_count,
+            live_orders_count=live_orders_count,
+            live_open_positions_count=live_open_positions_count,
+            execution_mode=self.settings.execution_mode.lower(),
+            live_trading_enabled=self.settings.live_trading_enabled,
             kill_switch_enabled=kill_switch_enabled,
+            live_kill_switch_enabled=live_kill_switch_enabled,
+            live_circuit_breaker_enabled=live_circuit_breaker_enabled,
             fetched_news_24h=fetched_news_24h,
             scheduler_cycles_24h=scheduler_cycles_24h,
             failed_cycles_24h=failed_cycles_24h,
@@ -340,4 +365,20 @@ class OperatorService:
         return AdminPaperStatsResponse(
             generated_at=now.isoformat(),
             stats=PaperTradeStats.model_validate(stats),
+        )
+
+    async def get_proof_of_edge_report(self, *, window_days: int = 7) -> ProofOfEdgeResponse:
+        now = datetime.now(UTC)
+        service = ProofOfEdgeService(
+            trade_repository=self.trade_repository,
+            analysis_repository=self.analysis_repository,
+            scheduler_cycle_repository=self.scheduler_cycle_repository,
+        )
+        report = await service.build_phase_gate_report(
+            settings=self.settings,
+            window_days=window_days,
+        )
+        return ProofOfEdgeResponse(
+            generated_at=now.isoformat(),
+            report=report,
         )

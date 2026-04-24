@@ -26,3 +26,34 @@ class TradeStatus(str, Enum):
 class PositionStatus(str, Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
+
+
+class ExecutionMode(str, Enum):
+    PAPER = "PAPER"
+    SHADOW = "SHADOW"
+    LIVE = "LIVE"
+
+
+class ExecutionIntentStatus(str, Enum):
+    SIMULATED = "SIMULATED"
+    SUBMITTED = "SUBMITTED"
+    FAILED = "FAILED"
+    CANCELED = "CANCELED"
+
+
+class LiveOrderStatus(str, Enum):
+    OPEN = "OPEN"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    FAILED = "FAILED"
+
+
+class LivePositionStatus(str, Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
+class ReconciliationStatus(str, Enum):
+    PASSED = "PASSED"
+    MISMATCH = "MISMATCH"
+    FAILED = "FAILED"

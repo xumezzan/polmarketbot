@@ -12,6 +12,8 @@ class PipelineItemResult(BaseModel):
     blocked_signal_count: int = 0
     opened_position_count: int = 0
     opened_trade_ids: list[int] = Field(default_factory=list)
+    execution_intent_ids: list[int] = Field(default_factory=list)
+    live_order_ids: list[int] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 

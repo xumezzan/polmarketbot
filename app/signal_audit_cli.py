@@ -5,6 +5,7 @@ import json
 from app.config import get_settings
 from app.database import AsyncSessionLocal
 from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.live_trade_repo import LiveTradeRepository
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
 from app.repositories.runtime_flag_repo import RuntimeFlagRepository
@@ -31,6 +32,7 @@ async def _main() -> None:
             analysis_repository=AnalysisRepository(session),
             signal_repository=SignalRepository(session),
             trade_repository=TradeRepository(session),
+            live_trade_repository=LiveTradeRepository(session),
             runtime_flag_repository=RuntimeFlagRepository(session),
             operator_state_repository=OperatorStateRepository(session),
             scheduler_cycle_repository=SchedulerCycleRepository(session),

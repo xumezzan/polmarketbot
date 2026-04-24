@@ -18,6 +18,14 @@ from app.schemas.news import NewsImportResult
 from app.schemas.scheduler import PipelineItemResult, SchedulerCycleResult
 from app.services.alerting import AlertingService, build_alert_client
 from app.services.daily_report import run_daily_report
+from app.services.live_execution import (
+    CircuitBreakerTriggeredError,
+    LiveExecutionError,
+    LiveKillSwitchEnabledError,
+    LiveTradingDisabledError,
+    place_live_order,
+    simulate_execution_intent,
+)
 from app.services.llm_analyzer import run_llm_analysis
 from app.services.market_client import run_market_matching
 from app.services.news_fetcher import run_news_ingestion
@@ -287,41 +295,129 @@ class PipelineScheduler:
                             item_result.approved_signal_count += 1
                             approved_signal_count += 1
 
-                            try:
-                                trade_result = await open_paper_position(
+                            execution_mode = self.settings.execution_mode.lower().strip()
+                            if execution_mode == "paper":
+                                try:
+                                    trade_result = await open_paper_position(
+                                        session,
+                                        self.settings,
+                                        signal_id=signal.signal_id,
+                                        risk_decision=decision,
+                                    )
+                                except PaperTradingDisabledError as exc:
+                                    item_result.blocked_signal_count += 1
+                                    log_event(
+                                        logger,
+                                        "paper_trade_open_skipped",
+                                        cycle_id=cycle_id,
+                                        news_item_id=item_result.news_item_id,
+                                        analysis_id=item_result.analysis_id,
+                                        signal_id=signal.signal_id,
+                                        reason=str(exc),
+                                    )
+                                    continue
+                                item_result.opened_position_count += 1
+                                item_result.opened_trade_ids.append(trade_result.trade_id)
+                                opened_position_count += 1
+                                self._dashboard_log(
+                                    "OPEN",
+                                    (
+                                        f"trade #{trade_result.trade_id} {trade_result.side} "
+                                        f"{self._format_price(trade_result.entry_price)} "
+                                        f"size={self._format_money(trade_result.size_usd)}"
+                                    ),
+                                    style="green",
+                                )
+                                await self._dashboard_refresh_data()
+                                await self.alerting_service.send_trade_opened(
+                                    cycle_id=cycle_id,
+                                    trade=trade_result,
+                                )
+                                continue
+
+                            if execution_mode == "shadow":
+                                shadow_result = await simulate_execution_intent(
                                     session,
                                     self.settings,
                                     signal_id=signal.signal_id,
-                                    risk_decision=decision,
+                                    approved_size_usd=decision.approved_size_usd,
                                 )
-                            except PaperTradingDisabledError as exc:
+                                item_result.execution_intent_ids.append(shadow_result.intent.intent_id)
+                                self._dashboard_log(
+                                    "SHDW",
+                                    (
+                                        f"signal #{signal.signal_id} intent #{shadow_result.intent.intent_id} "
+                                        f"{shadow_result.intent.side} "
+                                        f"{self._format_price(shadow_result.intent.requested_price)} "
+                                        f"size={self._format_money(shadow_result.intent.target_size_usd)}"
+                                    ),
+                                    style="cyan",
+                                )
+                                await self._dashboard_refresh_data()
+                                continue
+
+                            try:
+                                live_result = await place_live_order(
+                                    session,
+                                    self.settings,
+                                    signal_id=signal.signal_id,
+                                    approved_size_usd=decision.approved_size_usd,
+                                )
+                            except (
+                                LiveTradingDisabledError,
+                                LiveKillSwitchEnabledError,
+                                CircuitBreakerTriggeredError,
+                            ) as exc:
                                 item_result.blocked_signal_count += 1
                                 log_event(
                                     logger,
-                                    "paper_trade_open_skipped",
+                                    "live_trade_open_blocked",
                                     cycle_id=cycle_id,
                                     news_item_id=item_result.news_item_id,
                                     analysis_id=item_result.analysis_id,
                                     signal_id=signal.signal_id,
                                     reason=str(exc),
                                 )
+                                await self.alerting_service.send_live_order_failed(
+                                    cycle_id=cycle_id,
+                                    signal_id=signal.signal_id,
+                                    market_id=signal.market_id,
+                                    error=str(exc),
+                                )
                                 continue
-                            item_result.opened_position_count += 1
-                            item_result.opened_trade_ids.append(trade_result.trade_id)
-                            opened_position_count += 1
+                            except LiveExecutionError as exc:
+                                item_result.errors.append(str(exc))
+                                await self.alerting_service.send_live_order_failed(
+                                    cycle_id=cycle_id,
+                                    signal_id=signal.signal_id,
+                                    market_id=signal.market_id,
+                                    error=str(exc),
+                                )
+                                if not self.settings.scheduler_continue_on_item_error:
+                                    raise SchedulerError(str(exc)) from exc
+                                continue
+
+                            item_result.execution_intent_ids.append(live_result.intent.intent_id)
+                            if live_result.live_order_id is not None:
+                                item_result.live_order_ids.append(live_result.live_order_id)
+                            if live_result.live_position_id is not None:
+                                item_result.opened_position_count += 1
+                                opened_position_count += 1
                             self._dashboard_log(
-                                "OPEN",
+                                "LIVE",
                                 (
-                                    f"trade #{trade_result.trade_id} {trade_result.side} "
-                                    f"{self._format_price(trade_result.entry_price)} "
-                                    f"size={self._format_money(trade_result.size_usd)}"
+                                    f"order #{live_result.live_order_id} "
+                                    f"{live_result.intent.side} "
+                                    f"{self._format_price(live_result.intent.requested_price)} "
+                                    f"size={self._format_money(live_result.intent.target_size_usd)} "
+                                    f"status={live_result.order_status.lower()}"
                                 ),
-                                style="green",
+                                style="green" if live_result.live_position_id is not None else "yellow",
                             )
                             await self._dashboard_refresh_data()
-                            await self.alerting_service.send_trade_opened(
+                            await self.alerting_service.send_live_order_placed(
                                 cycle_id=cycle_id,
-                                trade=trade_result,
+                                result=live_result,
                             )
 
                         log_event(

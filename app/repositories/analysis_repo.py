@@ -229,3 +229,30 @@ class AnalysisRepository:
         await self.session.commit()
         await self.session.refresh(analysis)
         return analysis
+
+    async def save_execution_action(
+        self,
+        *,
+        analysis_id: int,
+        action: dict[str, object],
+    ) -> Analysis:
+        """Append one shadow/live execution audit action."""
+        analysis = await self.get_by_id(analysis_id)
+        if analysis is None:
+            raise ValueError(f"Analysis {analysis_id} not found.")
+
+        raw_response = dict(analysis.raw_response or {})
+        snapshots = dict(raw_response.get("snapshots") or {})
+        execution_snapshot = dict(snapshots.get("execution") or {})
+        actions = list(execution_snapshot.get("actions") or [])
+        actions.append(action)
+
+        execution_snapshot["updated_at"] = action.get("action_at")
+        execution_snapshot["actions"] = actions
+        snapshots["execution"] = execution_snapshot
+        raw_response["snapshots"] = snapshots
+
+        analysis.raw_response = raw_response
+        await self.session.commit()
+        await self.session.refresh(analysis)
+        return analysis

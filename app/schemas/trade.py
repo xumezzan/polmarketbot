@@ -166,3 +166,54 @@ class PaperTradeAnalytics(BaseModel):
     by_market: list[PaperTradeBreakdownRow] = Field(default_factory=list)
     by_source: list[PaperTradeBreakdownRow] = Field(default_factory=list)
     risk_blockers: list[PaperRiskBlockerCount] = Field(default_factory=list)
+
+
+class PaperTradeAuditRow(BaseModel):
+    """Operator-facing normalized trade row for proof-of-edge review."""
+
+    trade_id: int
+    signal_id: int
+    market_id: str
+    market_question: str | None = None
+    news_source: str | None = None
+    opened_at: str
+    closed_at: str | None = None
+    side: str
+    entry_price: float
+    exit_price: float | None = None
+    size_usd: float
+    pnl: float | None = None
+    close_reason: str | None = None
+
+
+class PaperTradeConsistencyVerdict(BaseModel):
+    """Compact consistency verdict for phase-gate decisions."""
+
+    status: str
+    summary: str
+    unstable_days: list[str] = Field(default_factory=list)
+    concentration_ratio: float = 0.0
+
+
+class PaperTradePhaseGateReport(BaseModel):
+    """Proof-of-edge decision report for progressing beyond paper trading."""
+
+    generated_at: str
+    window_days: int
+    required_min_days: int
+    required_max_days: int
+    required_min_closed_trades: int
+    verdict: str
+    reasons: list[str] = Field(default_factory=list)
+    win_rate: float = 0.0
+    avg_pnl: float = 0.0
+    total_pnl: float = 0.0
+    closed_trades: int = 0
+    analyses: int = 0
+    actionable_signals: int = 0
+    approved_signals: int = 0
+    pipeline_failed_cycles: int = 0
+    top_winners: list[PaperTradeAuditRow] = Field(default_factory=list)
+    top_losers: list[PaperTradeAuditRow] = Field(default_factory=list)
+    risk_blockers: list[PaperRiskBlockerCount] = Field(default_factory=list)
+    consistency: PaperTradeConsistencyVerdict

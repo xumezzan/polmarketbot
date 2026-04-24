@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 
+from app.schemas.trade import PaperTradePhaseGateReport
 from app.schemas.trade import PaperTradeStats
 
 
@@ -27,7 +28,13 @@ class AdminStatusResponse(BaseModel):
     signals_count: int = 0
     paper_trades_count: int = 0
     open_positions_count: int = 0
+    live_orders_count: int = 0
+    live_open_positions_count: int = 0
+    execution_mode: str = "paper"
+    live_trading_enabled: bool = False
     kill_switch_enabled: bool = False
+    live_kill_switch_enabled: bool = False
+    live_circuit_breaker_enabled: bool = False
     fetched_news_24h: int = 0
     scheduler_cycles_24h: int = 0
     failed_cycles_24h: int = 0
@@ -138,3 +145,10 @@ class AdminPaperStatsResponse(BaseModel):
 
     generated_at: str
     stats: PaperTradeStats
+
+
+class ProofOfEdgeResponse(BaseModel):
+    """Proof-of-edge phase-gate response."""
+
+    generated_at: str
+    report: PaperTradePhaseGateReport

@@ -52,3 +52,31 @@ class RuntimeFlagRepository:
         await self.session.refresh(flag)
         return flag
 
+    async def get_text(self, *, key: str) -> str | None:
+        """Return the stored text_value or None if the key does not exist."""
+        flag = await self.get(key=key)
+        if flag is None:
+            return None
+        return flag.text_value
+
+    async def set_text(self, *, key: str, value: str | None) -> RuntimeFlag:
+        """Upsert a text_value for the given key."""
+        flag = await self.get(key=key)
+        now = datetime.now(UTC)
+
+        if flag is None:
+            flag = RuntimeFlag(
+                key=key,
+                bool_value=False,
+                text_value=value,
+                updated_at=now,
+            )
+            self.session.add(flag)
+        else:
+            flag.text_value = value
+            flag.updated_at = now
+
+        await self.session.commit()
+        await self.session.refresh(flag)
+        return flag
+

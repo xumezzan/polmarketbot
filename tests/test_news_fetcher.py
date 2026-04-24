@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 
 from app.services.news_fetcher import (
     FallbackNewsClient,
+    NewsApiClient,
     RssNewsClient,
     StubNewsClient,
     filter_rss_articles_by_source,
@@ -13,7 +14,23 @@ from app.services.news_fetcher import (
     resolve_newsapi_next_allowed_fetch_at,
     resolve_newsapi_cooldown_until,
 )
+from app.runtime_flags import (
+    RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL,
+    RUNTIME_FLAG_NEWSAPI_NEXT_ALLOWED_FETCH_AT,
+)
 from tests.helpers import build_test_settings
+
+
+class _FakeRuntimeFlagRepository:
+    def __init__(self) -> None:
+        self.values: dict[str, str | None] = {}
+
+    async def get_text(self, *, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set_text(self, *, key: str, value: str | None):
+        self.values[key] = value
+        return None
 
 
 def test_news_fetcher_uses_fallback_lookback_when_enabled() -> None:
@@ -93,6 +110,68 @@ def test_newsapi_fetch_interval_remaining_seconds_returns_none_when_expired() ->
     )
 
     assert remaining_seconds is None
+
+
+def test_newsapi_client_persists_cooldown_in_runtime_flags() -> None:
+    async def _run() -> None:
+        repo = _FakeRuntimeFlagRepository()
+        client = NewsApiClient(
+            build_test_settings(news_fetch_mode="newsapi", news_api_key="test-key"),
+            runtime_flag_repository=repo,
+        )
+        cooldown_until = datetime(2026, 4, 18, 12, 30, tzinfo=UTC)
+
+        await client._set_newsapi_cooldown(cooldown_until)
+        status = await client._get_newsapi_cooldown_status(
+            now=datetime(2026, 4, 18, 12, 0, tzinfo=UTC)
+        )
+
+        assert repo.values[RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL] == cooldown_until.isoformat()
+        assert status == (cooldown_until, 1800)
+
+    asyncio.run(_run())
+
+
+def test_newsapi_client_clears_expired_cooldown_from_runtime_flags() -> None:
+    async def _run() -> None:
+        repo = _FakeRuntimeFlagRepository()
+        repo.values[RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL] = "2026-04-18T11:30:00+00:00"
+        client = NewsApiClient(
+            build_test_settings(news_fetch_mode="newsapi", news_api_key="test-key"),
+            runtime_flag_repository=repo,
+        )
+
+        status = await client._get_newsapi_cooldown_status(
+            now=datetime(2026, 4, 18, 12, 0, tzinfo=UTC)
+        )
+
+        assert status is None
+        assert repo.values[RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL] is None
+
+    asyncio.run(_run())
+
+
+def test_newsapi_client_persists_next_allowed_fetch_at_in_runtime_flags() -> None:
+    async def _run() -> None:
+        repo = _FakeRuntimeFlagRepository()
+        client = NewsApiClient(
+            build_test_settings(news_fetch_mode="newsapi", news_api_key="test-key"),
+            runtime_flag_repository=repo,
+        )
+        now = datetime(2026, 4, 18, 12, 0, tzinfo=UTC)
+
+        await client._set_newsapi_next_allowed_fetch(
+            now=now,
+            min_interval_minutes=30,
+        )
+        status = await client._get_newsapi_min_fetch_interval_status(now=now)
+
+        assert repo.values[RUNTIME_FLAG_NEWSAPI_NEXT_ALLOWED_FETCH_AT] == (
+            "2026-04-18T12:30:00+00:00"
+        )
+        assert status == (datetime(2026, 4, 18, 12, 30, tzinfo=UTC), 1800)
+
+    asyncio.run(_run())
 
 
 def test_stub_news_client_returns_recent_articles() -> None:

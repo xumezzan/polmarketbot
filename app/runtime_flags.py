@@ -1,2 +1,5 @@
 RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH = "paper_trading_kill_switch"
-
+RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH = "live_trading_kill_switch"
+RUNTIME_FLAG_LIVE_CIRCUIT_BREAKER = "live_circuit_breaker"
+RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL = "newsapi_cooldown_until"
+RUNTIME_FLAG_NEWSAPI_NEXT_ALLOWED_FETCH_AT = "newsapi_next_allowed_fetch_at"

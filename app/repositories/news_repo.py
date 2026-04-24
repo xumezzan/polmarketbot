@@ -104,3 +104,40 @@ class NewsRepository:
         if limit is not None:
             stmt = stmt.limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())
+
+    async def count_stale_without_analysis(self, *, cutoff: datetime) -> int:
+        """Return unanalyzed news rows older than the provided cutoff timestamp."""
+        analysis_exists = (
+            sa.select(sa.literal(1))
+            .select_from(Analysis)
+            .where(Analysis.news_item_id == NewsItem.id)
+        )
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(NewsItem)
+            .where(
+                ~sa.exists(analysis_exists),
+                NewsItem.published_at.is_not(None),
+                NewsItem.published_at < cutoff,
+            )
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def delete_stale_without_analysis(self, *, cutoff: datetime) -> int:
+        """Delete unanalyzed news rows older than the provided cutoff timestamp."""
+        analysis_exists = (
+            sa.select(sa.literal(1))
+            .select_from(Analysis)
+            .where(Analysis.news_item_id == NewsItem.id)
+        )
+        stmt = (
+            sa.delete(NewsItem)
+            .where(
+                ~sa.exists(analysis_exists),
+                NewsItem.published_at.is_not(None),
+                NewsItem.published_at < cutoff,
+            )
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return int(result.rowcount or 0)

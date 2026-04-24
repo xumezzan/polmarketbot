@@ -158,6 +158,14 @@ class SchedulerCycleRepository:
         stmt = sa.select(SchedulerCycle).order_by(SchedulerCycle.started_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())
 
+    async def list_since(self, *, since: datetime) -> list[SchedulerCycle]:
+        stmt = (
+            sa.select(SchedulerCycle)
+            .where(SchedulerCycle.started_at >= since)
+            .order_by(SchedulerCycle.started_at)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def get_latest(self) -> SchedulerCycle | None:
         stmt = sa.select(SchedulerCycle).order_by(SchedulerCycle.started_at.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
