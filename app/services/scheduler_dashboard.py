@@ -18,7 +18,9 @@ from app.database import AsyncSessionLocal
 from app.models.enums import PositionStatus, TradeStatus
 from app.models.position import Position
 from app.models.trade import PaperTrade
+from app.repositories.news_repo import NewsRepository
 from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
+from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
 from app.schemas.scheduler import SchedulerCycleResult
 
@@ -88,6 +90,8 @@ class DashboardCycleRow:
 class DashboardSnapshot:
     total_pnl: float = 0.0
     total_trades: int = 0
+    predictions_count: int = 0
+    news_items_count: int = 0
     closed_trades: int = 0
     open_positions: int = 0
     winning_trades: int = 0
@@ -132,9 +136,10 @@ class SchedulerDashboard:
         self.settings = settings
         self.interval_minutes = interval_minutes or settings.scheduler_interval_minutes
         self.console = Console()
-        self.brand_name = "PENNY SNIPER"
-        self.account_name = "yourbot"
-        self.source_file = "penny_sniper.py"
+        self.brand_name = settings.dashboard_brand_name
+        self.account_name = settings.dashboard_account_name
+        self.source_file = "penny_sniper.cpp"
+        self.tagline = settings.dashboard_tagline
         self.snapshot = DashboardSnapshot(recent_trades=[], recent_cycle_ids=[])
         self.log_lines: deque[DashboardLogLine] = deque(maxlen=200)
         self.status = "IDLE"
@@ -174,8 +179,12 @@ class SchedulerDashboard:
         async with AsyncSessionLocal() as session:
             trade_repository = TradeRepository(session)
             cycle_repository = SchedulerCycleRepository(session)
+            signal_repository = SignalRepository(session)
+            news_repository = NewsRepository(session)
 
             stats = await trade_repository.get_trade_statistics()
+            predictions_count = await signal_repository.count()
+            news_items_count = await news_repository.count()
             recent_trades = await trade_repository.list_recent_closed_trades(limit=10)
             open_positions = await trade_repository.list_open_positions()
             top_wins = await trade_repository.list_top_closed_trades(limit=20, descending=True)
@@ -211,6 +220,8 @@ class SchedulerDashboard:
         self.snapshot = DashboardSnapshot(
             total_pnl=float(stats.get("total_pnl", 0.0)),
             total_trades=int(stats.get("total_trades", 0)),
+            predictions_count=predictions_count,
+            news_items_count=news_items_count,
             closed_trades=int(stats.get("closed_trades", 0)),
             open_positions=int(stats.get("open_positions", 0)),
             winning_trades=int(stats.get("winning_trades", 0)),
@@ -310,29 +321,23 @@ class SchedulerDashboard:
         layout = Layout()
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="stats", size=5),
+            Layout(name="stats", size=7),
             Layout(name="body", ratio=1),
-            Layout(name="terminal", size=12),
             Layout(name="footer", size=3),
         )
         layout["body"].split_row(
             Layout(name="main", ratio=12),
-            Layout(name="sidecar", ratio=8),
+            Layout(name="source", ratio=6),
         )
-        layout["sidecar"].split_column(
-            Layout(name="cycles", size=11),
-            Layout(name="leaders", size=14),
-            Layout(name="alerts", size=10),
-            Layout(name="engine"),
+        layout["main"].split_column(
+            Layout(name="snipes", ratio=1),
+            Layout(name="terminal", size=9),
         )
 
         layout["header"].update(self._build_header())
         layout["stats"].update(self._build_stats())
-        layout["main"].update(self._build_main_panel())
-        layout["cycles"].update(self._build_cycles_panel())
-        layout["leaders"].update(self._build_leaders_panel())
-        layout["alerts"].update(self._build_alerts_panel())
-        layout["engine"].update(self._build_engine_panel())
+        layout["snipes"].update(self._build_main_panel())
+        layout["source"].update(self._build_engine_panel())
         layout["terminal"].update(self._build_terminal_panel())
         layout["footer"].update(self._build_footer())
         return layout
@@ -362,7 +367,7 @@ class SchedulerDashboard:
         left.append("  |  ", style="dim")
         left.append("Polygon", style="grey70")
         left.append("  |  ", style="dim")
-        left.append(self.status, style=status_style)
+        left.append(self.status.lower(), style=status_style)
 
         right = Text()
         right.append(now_text, style="bold white")
@@ -371,7 +376,7 @@ class SchedulerDashboard:
             right.append(self._format_countdown(self.next_run_at), style="yellow")
 
         header.add_row(left, right)
-        return Panel(header, border_style="bright_black", box=box.SQUARE)
+        return Panel(header, border_style="bright_black", box=box.SQUARE, padding=(0, 1))
 
     def _build_stats(self):
         grid = Table.grid(expand=True)
@@ -382,18 +387,18 @@ class SchedulerDashboard:
             self._stat_block(
                 "ACCOUNT",
                 self.account_name,
-                f"{self.settings.news_fetch_mode.lower()} | {self.settings.llm_mode.lower()} | {self.settings.market_fetch_mode.lower()}",
+                self.tagline,
             ),
             self._stat_block(
-                "PROFIT/LOSS",
+                "▲ Profit/Loss",
                 self._format_money(self.snapshot.total_pnl),
-                "all-time",
+                "All-Time",
                 value_style="bold green" if self.snapshot.total_pnl >= 0 else "bold red",
             ),
             self._stat_block(
                 "PREDICTIONS",
-                str(self.snapshot.total_trades),
-                f"{self.snapshot.closed_trades} closed | {self.snapshot.open_positions} open",
+                f"{self.snapshot.predictions_count:,}".replace(",", " "),
+                f"{self.snapshot.news_items_count:,} news scanned",
             ),
             self._stat_block(
                 "POSITIONS",
@@ -407,7 +412,7 @@ class SchedulerDashboard:
                 value_style="bold yellow",
             ),
         )
-        return Panel(grid, border_style="bright_black", box=box.SQUARE)
+        return Panel(grid, border_style="bright_black", box=box.SQUARE, padding=(1, 2))
 
     def _build_main_panel(self):
         if self.main_view == "OPEN":
@@ -447,7 +452,6 @@ class SchedulerDashboard:
         return Panel(
             table,
             title=self._panel_title("PENNY SNIPES"),
-            subtitle=self._panel_tabs(active="CLOSED", secondary="OPEN"),
             border_style="bright_black",
             box=box.SQUARE,
         )
@@ -482,7 +486,6 @@ class SchedulerDashboard:
         return Panel(
             table,
             title=self._panel_title("PENNY SNIPES"),
-            subtitle=self._panel_tabs(active="OPEN", secondary="CLOSED"),
             border_style="bright_black",
             box=box.SQUARE,
         )
@@ -618,22 +621,26 @@ class SchedulerDashboard:
 
     def _build_terminal_panel(self):
         if not self.log_lines:
-            return Panel(
-                Text("No runtime events yet.", style="dim"),
-                title=self._panel_title("TERMINAL"),
-                border_style="bright_black",
-                box=box.SQUARE,
-            )
+            rendered = [Text("[SNIPER] Penny Sniper online", style="bold white")]
+        else:
+            rendered = []
+            for line in list(self.log_lines)[-5:]:
+                text = Text()
+                text.append(f"[{line.timestamp}] ", style="dim")
+                line_style = self._terminal_style(line.tag, line.style)
+                text.append(f"{line.tag:<5}", style=line_style)
+                text.append(" ")
+                text.append(line.message, style=line_style)
+                rendered.append(text)
 
-        rendered = []
-        for line in list(self.log_lines)[-9:]:
-            text = Text()
-            text.append(f"[{line.timestamp}] ", style="dim")
-            line_style = self._terminal_style(line.tag, line.style)
-            text.append(f"{line.tag:<5}", style=line_style)
-            text.append(" ")
-            text.append(line.message, style=line_style)
-            rendered.append(text)
+        command = Text()
+        command.append(f"{self.account_name}@polymarket:~$ ", style="bold green")
+        command.append("./penny_sniper ", style="bold white")
+        command.append(f"--max-entry={self.settings.risk_max_trade_size_usd:.0f} ", style="yellow")
+        command.append("--scan-all ", style="yellow")
+        command.append(f"--source={self.settings.news_fetch_mode.lower()} ", style="yellow")
+        command.append(f"--llm={self.settings.llm_mode.lower()}", style="yellow")
+        rendered.append(command)
 
         return Panel(
             Group(*rendered),
@@ -643,16 +650,6 @@ class SchedulerDashboard:
         )
 
     def _build_footer(self):
-        command = Text()
-        command.append(f"{self.account_name}@polymarket:~$ ", style="bold green")
-        command.append("./penny_sniper ", style="bold white")
-        command.append(f"--view={self.main_view.lower()} ", style="yellow")
-        command.append(f"--filter={self.category_filter.lower()} ", style="yellow")
-        command.append(f"--leaders={self.leaderboard_mode.lower()} ", style="yellow")
-        command.append(f"--interval={self.interval_minutes:g}m ", style="yellow")
-        command.append(f"--source={self.settings.news_fetch_mode.lower()} ", style="yellow")
-        command.append(f"--llm={self.settings.llm_mode.lower()}", style="yellow")
-
         status = Text()
         status.append("ACCOUNT: ", style="dim")
         status.append(self.account_name, style="bold white")
@@ -662,31 +659,23 @@ class SchedulerDashboard:
             style="bold green" if self.snapshot.total_pnl >= 0 else "bold red",
         )
         status.append("   PREDICTIONS: ", style="dim")
-        status.append(str(self.snapshot.total_trades), style="bold white")
+        status.append(f"{self.snapshot.predictions_count:,}".replace(",", " "), style="bold white")
+        status.append("   DEV: ", style="dim")
+        status.append("@polmarketbot", style="bold cyan")
+        status.append("   API: ", style="dim")
+        status.append("polymarket.com", style="bold white")
         status.append("   OPEN: ", style="dim")
         status.append(str(self.snapshot.open_positions), style="bold white")
-        status.append("   FILTER: ", style="dim")
-        status.append(self.category_filter.lower(), style="bold yellow")
-        status.append("   LEADERS: ", style="dim")
-        status.append(self.leaderboard_mode.lower(), style="bold yellow")
-        status.append("   WIN RATE: ", style="dim")
-        status.append(f"{self.snapshot.win_rate * 100:.1f}%", style="bold cyan")
-        status.append("   24H CYCLES: ", style="dim")
-        status.append(str(self.snapshot.cycles_24h), style="bold white")
+        status.append("   WS: ", style="dim")
+        status.append("connected", style="bold green" if self.status != "ERROR" else "bold red")
         status.append("   [f] ", style="dim")
         status.append("toggle", style="bold cyan")
-        status.append("   [c] ", style="dim")
-        status.append("filter", style="bold yellow")
-        status.append("   [t] ", style="dim")
-        status.append("leaders", style="bold yellow")
         status.append("   [r] ", style="dim")
         status.append("refresh", style="bold cyan")
         status.append("   [q] ", style="dim")
         status.append("quit", style="bold cyan")
-        status.append("   conn", style="dim")
-        status.append(" ●", style="bold green" if self.status != "ERROR" else "bold red")
 
-        return Panel(Group(command, status), border_style="bright_black", box=box.SQUARE)
+        return Panel(status, border_style="bright_black", box=box.SQUARE)
 
     def _trade_row_from_model(self, trade: PaperTrade) -> DashboardTradeRow:
         market = None
@@ -728,26 +717,32 @@ class SchedulerDashboard:
                 "matcher = DomainRanker()",
                 "risk = RiskManager()",
                 "paper = PaperTrader()",
+                "execution = ShadowExecution()",
                 f"totalWins = {self.snapshot.winning_trades}",
                 "",
-                "def scan_all_markets():",
-                f'    feed = "{self.settings.news_fetch_mode.lower()}"',
-                f'    llm = "{self.settings.llm_mode.lower()}"',
-                f'    market = "{self.settings.market_fetch_mode.lower()}"',
-                f"    batch = {self.settings.scheduler_news_batch_limit}",
-                '    domains = ["crypto", "macro",',
-                '               "geopolitical", "sports"]',
+                "class PennySniper:",
+                "    def scan_all_markets(self):",
+                f'        feed = "{self.settings.news_fetch_mode.lower()}"',
+                f'        llm = "{self.settings.llm_mode.lower()}"',
+                f'        market = "{self.settings.market_fetch_mode.lower()}"',
+                f"        batch = {self.settings.scheduler_news_batch_limit}",
+                '        domains = ["crypto", "macro", "politics"]',
+                "        return scanner.find_edges(domains)",
                 "",
-                "def on_cycle_end():",
-                "    latest = {",
-                f'        "status": "{self.snapshot.latest_cycle_status}",',
-                f'        "processed": {self.snapshot.latest_cycle_processed_news},',
-                f'        "approved": {self.snapshot.latest_cycle_approved_signals},',
-                f'        "opened": {self.snapshot.latest_cycle_opened_positions},',
-                f'        "closed": {self.snapshot.latest_cycle_closed_positions},',
-                f'        "errors": {self.snapshot.latest_cycle_errors},',
-                "    }",
-                "    return latest",
+                "    def check_opportunity(self, signal):",
+                "        if not risk.approve(signal):",
+                "            return None",
+                "        if execution.mode == 'shadow':",
+                "            return execution.build_intent(signal)",
+                "        return paper.open_position(signal)",
+                "",
+                "latest = {",
+                f'    "status": "{self.snapshot.latest_cycle_status}",',
+                f'    "processed": {self.snapshot.latest_cycle_processed_news},',
+                f'    "approved": {self.snapshot.latest_cycle_approved_signals},',
+                f'    "opened": {self.snapshot.latest_cycle_opened_positions},',
+                f'    "errors": {self.snapshot.latest_cycle_errors},',
+                "}",
             ]
         )
 

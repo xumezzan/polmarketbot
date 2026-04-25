@@ -27,7 +27,13 @@ def _ensure_version_table_capacity(connection) -> None:
             """
             DO $$
             BEGIN
-                IF EXISTS (
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.tables WHERE table_name = 'alembic_version'
+                ) THEN
+                    CREATE TABLE alembic_version (
+                        version_num VARCHAR(255) PRIMARY KEY
+                    );
+                ELSIF EXISTS (
                     SELECT 1
                     FROM information_schema.columns
                     WHERE table_name = 'alembic_version'

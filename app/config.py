@@ -145,6 +145,9 @@ class Settings(BaseSettings):
     scheduler_continue_on_item_error: bool = True
     scheduler_lock_enabled: bool = True
     scheduler_lock_key: int = 48151623
+    dashboard_brand_name: str = "PENNY SNIPER"
+    dashboard_account_name: str = "planktonXD"
+    dashboard_tagline: str = "having fun"
     operator_recent_signals_default_limit: int = 20
     operator_recent_signals_max_limit: int = 100
     alert_mode: str = "noop"
