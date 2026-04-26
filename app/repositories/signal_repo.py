@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.analysis import Analysis
+from app.models.forecast_observation import ForecastObservation
 from app.models.enums import SignalStatus
 from app.models.signal import Signal
 
@@ -35,6 +36,42 @@ class SignalRepository:
         stmt = self._with_context().order_by(Signal.id.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())
 
+    async def list_created_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        signal_statuses: list[SignalStatus] | None = None,
+    ) -> list[Signal]:
+        """Return signals created in a window with linked analysis/news context."""
+        stmt = (
+            self._with_context()
+            .where(
+                Signal.created_at >= since,
+                Signal.created_at <= until,
+            )
+            .order_by(Signal.created_at, Signal.id)
+        )
+        if signal_statuses:
+            stmt = stmt.where(Signal.signal_status.in_(signal_statuses))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_without_observation(
+        self,
+        *,
+        signal_statuses: list[SignalStatus] | None = None,
+    ) -> list[Signal]:
+        """Return signals that still have no resolved forecast observation row."""
+        stmt = (
+            self._with_context()
+            .outerjoin(ForecastObservation, ForecastObservation.signal_id == Signal.id)
+            .where(ForecastObservation.id.is_(None))
+            .order_by(Signal.created_at, Signal.id)
+        )
+        if signal_statuses:
+            stmt = stmt.where(Signal.signal_status.in_(signal_statuses))
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def get_by_analysis_and_market(
         self,
         *,
@@ -61,8 +98,15 @@ class SignalRepository:
         market_slug: str | None,
         market_question: str | None,
         market_price: float,
+        execution_price: float | None,
+        raw_fair_probability: float | None,
         fair_probability: float,
+        raw_edge: float | None,
         edge: float,
+        estimated_fee_rate: float | None,
+        estimated_fee_per_share: float | None,
+        market_consensus_weight: float | None,
+        calibration_sample_count: int | None,
         signal_status: SignalStatus,
         explanation: str,
     ) -> Signal:
@@ -79,8 +123,15 @@ class SignalRepository:
                 market_slug=market_slug,
                 market_question=market_question,
                 market_price=market_price,
+                execution_price=execution_price,
+                raw_fair_probability=raw_fair_probability,
                 fair_probability=fair_probability,
+                raw_edge=raw_edge,
                 edge=edge,
+                estimated_fee_rate=estimated_fee_rate,
+                estimated_fee_per_share=estimated_fee_per_share,
+                market_consensus_weight=market_consensus_weight,
+                calibration_sample_count=calibration_sample_count,
                 signal_status=signal_status,
                 explanation=explanation,
             )
@@ -89,8 +140,15 @@ class SignalRepository:
             signal.market_slug = market_slug
             signal.market_question = market_question
             signal.market_price = market_price
+            signal.execution_price = execution_price
+            signal.raw_fair_probability = raw_fair_probability
             signal.fair_probability = fair_probability
+            signal.raw_edge = raw_edge
             signal.edge = edge
+            signal.estimated_fee_rate = estimated_fee_rate
+            signal.estimated_fee_per_share = estimated_fee_per_share
+            signal.market_consensus_weight = market_consensus_weight
+            signal.calibration_sample_count = calibration_sample_count
             signal.signal_status = signal_status
             signal.explanation = explanation
 

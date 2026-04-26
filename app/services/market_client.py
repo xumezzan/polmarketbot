@@ -40,6 +40,143 @@ STOPWORDS = {
     "will",
 }
 
+QUERY_FILLER_TOKENS = {
+    "approval",
+    "approve",
+    "approved",
+    "called",
+    "every",
+    "exchange",
+    "forecast",
+    "implications",
+    "impact",
+    "increase",
+    "indicator",
+    "operations",
+    "prediction",
+    "price",
+    "reach",
+    "resistance",
+    "signal",
+    "simple",
+    "since",
+    "status",
+    "target",
+    "transaction",
+    "upgrades",
+    "volume",
+}
+
+ASSET_DOMAIN_ALIASES = {
+    "bitcoin": {"bitcoin", "btc"},
+    "ethereum": {"ethereum", "eth", "ether"},
+    "xrp": {"xrp", "ripple"},
+    "solana": {"solana", "sol"},
+    "dogecoin": {"dogecoin", "doge"},
+    "cardano": {"cardano", "ada"},
+}
+
+MACRO_DOMAIN_TOKENS = {
+    "fed",
+    "federal",
+    "reserve",
+    "powell",
+    "rate",
+    "rates",
+    "fomc",
+    "inflation",
+    "cpi",
+    "recession",
+    "tariff",
+    "economy",
+}
+
+CRYPTO_DOMAIN_TOKENS = {
+    "crypto",
+    "bitcoin",
+    "btc",
+    "ethereum",
+    "eth",
+    "ether",
+    "xrp",
+    "ripple",
+    "solana",
+    "sol",
+    "doge",
+    "dogecoin",
+    "cardano",
+    "ada",
+    "stablecoin",
+    "stablecoins",
+    "etf",
+    "etfs",
+    "token",
+    "tokens",
+    "blockchain",
+    "exchange",
+    "sec",
+    "cftc",
+    "clarity",
+}
+
+GENERIC_DOMAIN_TOKENS = {
+    "all",
+    "time",
+    "high",
+    "low",
+    "new",
+    "year",
+    "month",
+    "quarter",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "status",
+    "operations",
+    "approval",
+    "target",
+    "market",
+    "markets",
+    "regulation",
+    "lawsuit",
+    "legal",
+    "court",
+    "policy",
+    "adoption",
+    "payment",
+    "payments",
+    "banks",
+    "polymarket",
+}
+
+PRICE_TARGET_MARKET_TOKENS = {
+    "above",
+    "below",
+    "hit",
+    "reach",
+    "reaches",
+    "reaching",
+}
+
+RELATIVE_PERFORMANCE_TOKENS = {
+    "beat",
+    "beats",
+    "best",
+    "outperform",
+    "outperforms",
+    "performance",
+    "perform",
+}
+
 
 class MarketClientError(Exception):
     """Raised when market fetching or matching fails."""
@@ -50,6 +187,9 @@ class MarketClientProtocol(Protocol):
 
     async def fetch_markets(self) -> list[GammaMarket]:
         """Return a list of normalized markets."""
+
+    async def fetch_market(self, market_id: str) -> GammaMarket | None:
+        """Return one normalized market snapshot by id."""
 
 
 class StubPolymarketClient:
@@ -186,6 +326,12 @@ class StubPolymarketClient:
 
         return [self._normalize_market(payload) for payload in stub_payloads]
 
+    async def fetch_market(self, market_id: str) -> GammaMarket | None:
+        for market in await self.fetch_markets():
+            if market.id == market_id:
+                return market
+        return None
+
     def _normalize_market(self, payload: dict[str, object]) -> GammaMarket:
         market = GammaMarket.model_validate(payload)
         market.raw_payload = payload
@@ -261,6 +407,52 @@ class GammaPolymarketClient:
         )
         return markets
 
+    async def fetch_market(self, market_id: str) -> GammaMarket | None:
+        base_url = f"{self.settings.gamma_api_base_url.rstrip('/')}/markets/{market_id}"
+
+        async with httpx.AsyncClient(timeout=self.settings.gamma_request_timeout_seconds) as client:
+            async def _request_once() -> httpx.Response:
+                response = await client.get(base_url)
+                response.raise_for_status()
+                return response
+
+            try:
+                response = await retry_async(
+                    _request_once,
+                    logger=logger,
+                    provider="polymarket_gamma",
+                    operation_name="fetch_market_by_id",
+                    max_attempts=self.settings.gamma_retry_max_attempts,
+                    base_delay_seconds=self.settings.gamma_retry_base_delay_seconds,
+                    is_retryable=_is_retryable_gamma_exception,
+                    context={"market_id": market_id},
+                )
+            except httpx.HTTPError as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+                    return None
+                log_event(
+                    logger,
+                    "gamma_single_market_fetch_failed",
+                    provider="polymarket_gamma",
+                    market_id=market_id,
+                    error=str(exc),
+                )
+                raise MarketClientError(f"Gamma market fetch failed: {exc}") from exc
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise MarketClientError("Gamma /markets/{id} returned a non-object payload.")
+
+        market = self._normalize_market(payload)
+        log_event(
+            logger,
+            "gamma_single_market_fetch_completed",
+            provider="polymarket_gamma",
+            market_id=market_id,
+            closed=market.closed,
+        )
+        return market
+
     def _normalize_market(self, payload: dict[str, object]) -> GammaMarket:
         market = GammaMarket.model_validate(payload)
         market.raw_payload = payload
@@ -299,16 +491,25 @@ class KeywordMarketRanker:
         analysis: Analysis,
         markets: list[GammaMarket],
     ) -> list[MarketCandidate]:
-        query_tokens = _tokenize(analysis.market_query)
-        query_phrase = analysis.market_query.strip().lower()
+        query_text = normalize_market_query(analysis.market_query)
+        query_tokens = _tokenize(query_text)
+        query_phrase = query_text.strip().lower()
 
         ranked: list[MarketCandidate] = []
         for market in markets:
+            contract_compatibility = market_contract_compatibility(
+                query_text=query_phrase,
+                market=market,
+            )
+            if contract_compatibility <= 0:
+                continue
+
             candidate = self._score_market(
                 analysis=analysis,
                 market=market,
                 query_tokens=query_tokens,
                 query_phrase=query_phrase,
+                contract_compatibility=contract_compatibility,
             )
             if candidate is not None:
                 ranked.append(candidate)
@@ -323,12 +524,19 @@ class KeywordMarketRanker:
         market: GammaMarket,
         query_tokens: set[str],
         query_phrase: str,
+        contract_compatibility: float,
     ) -> MarketCandidate | None:
         question_tokens = _tokenize(market.question)
         slug_tokens = _tokenize(market.slug or "")
         event_tokens = _tokenize(f"{market.event_title or ''} {market.event_slug or ''}")
 
-        exact_match = 1.0 if query_phrase and query_phrase in market.question.lower() else 0.0
+        exact_match = (
+            1.0
+            if len(query_tokens) >= 2
+            and query_phrase
+            and query_phrase in market.question.lower()
+            else 0.0
+        )
         question_overlap = _token_overlap(query_tokens, question_tokens)
         slug_overlap = _token_overlap(query_tokens, slug_tokens)
         event_overlap = _token_overlap(query_tokens, event_tokens)
@@ -341,7 +549,8 @@ class KeywordMarketRanker:
             "event_overlap": event_overlap * self.settings.market_match_event_weight,
             "liquidity_bonus": liquidity_bonus * self.settings.market_match_liquidity_weight,
         }
-        total_score = round(sum(score_breakdown.values()), 6)
+        raw_score = sum(score_breakdown.values())
+        total_score = round(raw_score * contract_compatibility, 6)
 
         if total_score < self.settings.market_match_min_score:
             return None
@@ -357,6 +566,8 @@ class KeywordMarketRanker:
             reasons.append(f"event token overlap={event_overlap:.2f}")
         if liquidity_bonus:
             reasons.append(f"liquidity bonus={liquidity_bonus:.2f}")
+        if contract_compatibility < 1:
+            reasons.append(f"contract type compatibility={contract_compatibility:.2f}")
 
         return MarketCandidate(
             analysis_id=analysis.id,
@@ -377,6 +588,8 @@ class KeywordMarketRanker:
             last_trade_price=market.last_trade_price,
             liquidity=market.liquidity,
             volume=market.volume,
+            fees_enabled=market.fees_enabled,
+            effective_taker_fee_rate=market.effective_taker_fee_rate,
             match_score=total_score,
             match_reasons=reasons,
             score_breakdown=score_breakdown,
@@ -449,14 +662,20 @@ class MarketMatchingService:
             raise MarketClientError("No analysis found to match against Polymarket.")
 
         markets = await self.client.fetch_markets()
-        ranked_candidates = self.ranker.rank(analysis=analysis, markets=markets)
+        normalized_query = normalize_market_query(analysis.market_query)
+        domain_anchor_tokens = extract_market_domain_anchor_tokens(normalized_query)
+        filtered_markets = filter_markets_by_query_domain(
+            markets=markets,
+            query_text=normalized_query,
+        )
+        ranked_candidates = self.ranker.rank(analysis=analysis, markets=filtered_markets)
         filtered_candidates = self.correlation_filter.apply(ranked_candidates)
         top_candidates = filtered_candidates[: self.settings.market_top_n]
 
         result = MarketMatchResult(
             analysis_id=analysis.id,
             news_item_id=analysis.news_item_id,
-            market_query=analysis.market_query,
+            market_query=normalized_query,
             fetch_mode=self.settings.market_fetch_mode.lower(),
             match_strategy=self.settings.market_match_strategy.lower(),
             fetched_count=len(markets),
@@ -470,7 +689,12 @@ class MarketMatchingService:
                 "generated_at": datetime.now(UTC).isoformat(),
                 "fetch_mode": result.fetch_mode,
                 "match_strategy": result.match_strategy,
+                "raw_market_query": analysis.market_query,
+                "normalized_market_query": result.market_query,
                 "fetched_count": result.fetched_count,
+                "domain_filter_applied": bool(domain_anchor_tokens),
+                "domain_anchor_tokens": sorted(domain_anchor_tokens),
+                "domain_filtered_count": len(filtered_markets),
                 "candidate_count": result.candidate_count,
                 "candidates": [candidate.model_dump(mode="json") for candidate in top_candidates],
             },
@@ -482,6 +706,7 @@ class MarketMatchingService:
             analysis_id=analysis.id,
             news_item_id=analysis.news_item_id,
             fetched_count=result.fetched_count,
+            domain_filtered_count=len(filtered_markets),
             candidate_count=result.candidate_count,
             market_query=result.market_query,
         )
@@ -539,6 +764,241 @@ async def run_market_matching(
 def _tokenize(value: str) -> set[str]:
     tokens = re.findall(r"[a-z0-9]+", value.lower())
     return {token for token in tokens if token not in STOPWORDS and len(token) > 1}
+
+
+def filter_markets_by_query_domain(
+    *,
+    markets: list[GammaMarket],
+    query_text: str,
+) -> list[GammaMarket]:
+    """Reduce the candidate universe to markets in the same domain as the query."""
+    lowered = (query_text or "").strip().lower()
+    query_tokens = set(_normalized_query_tokens(lowered))
+    if _is_generic_market_legal_query(query_tokens):
+        return []
+
+    anchor_tokens = extract_market_domain_anchor_tokens(query_text)
+    if not anchor_tokens:
+        fallback_tokens = [
+            token
+            for token in query_tokens
+            if token not in GENERIC_DOMAIN_TOKENS
+        ]
+        if lowered and lowered != "general news" and not fallback_tokens:
+            return []
+        return markets
+
+    filtered = [
+        market
+        for market in markets
+        if _market_domain_tokens(market) & anchor_tokens
+    ]
+    return filtered
+
+
+def market_contract_compatibility(*, query_text: str, market: GammaMarket) -> float:
+    """Return 0 when query and market describe incompatible contract types."""
+    query_type = infer_market_contract_type(query_text)
+    market_type = infer_market_contract_type(
+        " ".join(
+            part
+            for part in (
+                market.question,
+                market.slug or "",
+                market.event_title or "",
+                market.event_slug or "",
+            )
+            if part
+        )
+    )
+
+    if query_type == "generic" or market_type == "generic":
+        return 1.0
+    if query_type == market_type:
+        return 1.0
+    return 0.0
+
+
+def infer_market_contract_type(value: str) -> str:
+    """Classify the kind of binary market implied by text."""
+    lowered = (value or "").lower()
+    tokens = _tokenize(lowered)
+
+    if "all-time high" in lowered or "all time high" in lowered:
+        return "all_time_high"
+    if tokens & RELATIVE_PERFORMANCE_TOKENS:
+        return "relative_performance"
+    if _extract_price_target(lowered) is not None and (
+        tokens & PRICE_TARGET_MARKET_TOKENS or _detect_primary_asset(lowered) is not None
+    ):
+        return "price_target"
+    if (
+        _contains_phrase(lowered, "rate cut")
+        or _contains_phrase(lowered, "rate cuts")
+        or tokens & {"fomc", "fed"}
+        and tokens & {"cut", "cuts", "rate", "rates"}
+    ):
+        return "rate_cut"
+
+    return "generic"
+
+
+def extract_market_domain_anchor_tokens(query_text: str) -> set[str]:
+    """Return high-signal domain tokens used to prefilter Polymarket markets."""
+    lowered = (query_text or "").strip().lower()
+    if not lowered or lowered == "general news":
+        return set()
+    query_tokens = set(_normalized_query_tokens(lowered))
+
+    anchor_tokens: set[str] = set()
+    asset = _detect_primary_asset(lowered)
+    if asset is not None:
+        anchor_tokens |= ASSET_DOMAIN_ALIASES.get(asset, {asset})
+
+    if _contains_phrase(lowered, "federal reserve") or query_tokens & {"fed", "powell", "fomc"}:
+        anchor_tokens |= MACRO_DOMAIN_TOKENS
+    elif _contains_phrase(lowered, "rate cut") or _contains_phrase(lowered, "rate cuts"):
+        anchor_tokens |= {"fed", "federal", "reserve", "rate", "rates", "fomc"}
+
+    if query_tokens & {"stablecoin", "stablecoins"}:
+        anchor_tokens |= {"stablecoin", "stablecoins"}
+    elif query_tokens & {"etf", "etfs"}:
+        anchor_tokens |= {"etf", "etfs", "bitcoin", "btc", "ethereum", "eth", "ether"}
+    elif query_tokens & {"clarity"}:
+        anchor_tokens |= {"clarity", "crypto", "sec", "cftc"}
+    elif query_tokens & {"cftc", "sec"}:
+        anchor_tokens |= query_tokens & {"cftc", "sec"}
+    elif query_tokens & {"crypto", "blockchain", "token", "tokens", "exchange"}:
+        anchor_tokens |= CRYPTO_DOMAIN_TOKENS
+
+    if anchor_tokens:
+        return anchor_tokens
+
+    fallback_tokens = [
+        token
+        for token in _normalized_query_tokens(lowered)
+        if token not in GENERIC_DOMAIN_TOKENS
+    ]
+    return set(fallback_tokens[:2])
+
+
+def _contains_phrase(value: str, phrase: str) -> bool:
+    return re.search(rf"\b{re.escape(phrase)}\b", value) is not None
+
+
+def _is_generic_market_legal_query(query_tokens: set[str]) -> bool:
+    return bool(
+        query_tokens & {"market", "markets"}
+        and query_tokens & {"lawsuit", "regulation", "legal", "court", "policy"}
+        and not query_tokens & {"cftc", "sec", "clarity", "crypto", "bitcoin", "ethereum", "xrp"}
+    )
+
+
+def normalize_market_query(value: str) -> str:
+    """Reduce free-form LLM output to a tighter market-search query."""
+    raw = (value or "").strip()
+    if not raw:
+        return raw
+
+    lowered = raw.lower()
+    asset = _detect_primary_asset(lowered)
+    price_target = _extract_price_target(lowered)
+
+    if asset and ("all-time high" in lowered or "all time high" in lowered):
+        return f"{asset} all time high"
+
+    if asset and price_target is not None:
+        return f"{asset} {price_target}"
+
+    if asset and "government" in lowered and ("seizure" in lowered or "moves" in lowered):
+        return f"{asset} government transfer"
+
+    if asset and "tax" in lowered:
+        return f"{asset} tax"
+
+    if asset and "quantum" in lowered:
+        return f"{asset} quantum"
+
+    if asset and ("transaction volume" in lowered or "volume" in lowered):
+        return f"{asset} volume"
+
+    if "clarity act" in lowered:
+        return "clarity act crypto"
+
+    if "grinex" in lowered:
+        return "grinex exchange"
+
+    tokens = _normalized_query_tokens(lowered)
+    if asset and asset not in tokens:
+        tokens.insert(0, asset)
+
+    if not tokens:
+        return raw
+
+    return " ".join(tokens[:4])
+
+
+def _detect_primary_asset(value: str) -> str | None:
+    if any(token in value for token in ("bitcoin", " btc", "btc ", "btc-", "btc/")):
+        return "bitcoin"
+    if any(token in value for token in ("ethereum", " ether", "eth ", "eth-", "eth/")):
+        return "ethereum"
+    if "xrp" in value:
+        return "xrp"
+    return None
+
+
+def _extract_price_target(value: str) -> str | None:
+    million_match = re.search(r"(\d+(?:\.\d+)?)\s*m\b", value)
+    if million_match:
+        number = million_match.group(1).rstrip("0").rstrip(".")
+        return f"{number}m"
+
+    thousand_match = re.search(r"\$?\s*(\d{2,3})(?:[,\s]?(\d{3}))\b", value)
+    if thousand_match and thousand_match.group(2):
+        return f"{thousand_match.group(1)}k"
+
+    compact_thousand_match = re.search(r"(\d{2,3})\s*k\b", value)
+    if compact_thousand_match:
+        return f"{compact_thousand_match.group(1)}k"
+
+    return None
+
+
+def _normalized_query_tokens(value: str) -> list[str]:
+    alias_map = {
+        "btc": "bitcoin",
+        "eth": "ethereum",
+    }
+    raw_tokens = re.findall(r"[a-z0-9]+", value.lower())
+    tokens: list[str] = []
+
+    for token in raw_tokens:
+        mapped = alias_map.get(token, token)
+        if mapped in STOPWORDS or mapped in QUERY_FILLER_TOKENS:
+            continue
+        if re.fullmatch(r"20\d{2}", mapped):
+            continue
+        if len(mapped) <= 1:
+            continue
+        if mapped not in tokens:
+            tokens.append(mapped)
+
+    return tokens
+
+
+def _market_domain_tokens(market: GammaMarket) -> set[str]:
+    text = " ".join(
+        part
+        for part in (
+            market.question,
+            market.slug or "",
+            market.event_title or "",
+            market.event_slug or "",
+        )
+        if part
+    )
+    return _tokenize(text)
 
 
 def _token_overlap(query_tokens: set[str], document_tokens: set[str]) -> float:

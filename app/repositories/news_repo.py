@@ -89,7 +89,7 @@ class NewsRepository:
         stmt = sa.select(NewsItem).order_by(NewsItem.id.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def list_without_analysis(self, *, limit: int) -> list[NewsItem]:
+    async def list_without_analysis(self, *, limit: int | None = None) -> list[NewsItem]:
         """Return news items that have not gone through LLM analysis yet."""
         analysis_exists = (
             sa.select(sa.literal(1))
@@ -99,7 +99,45 @@ class NewsRepository:
         stmt = (
             sa.select(NewsItem)
             .where(~sa.exists(analysis_exists))
-            .order_by(NewsItem.id.asc())
-            .limit(limit)
+            .order_by(NewsItem.published_at.desc().nullslast(), NewsItem.id.desc())
         )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())
+
+    async def count_stale_without_analysis(self, *, cutoff: datetime) -> int:
+        """Return unanalyzed news rows older than the provided cutoff timestamp."""
+        analysis_exists = (
+            sa.select(sa.literal(1))
+            .select_from(Analysis)
+            .where(Analysis.news_item_id == NewsItem.id)
+        )
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(NewsItem)
+            .where(
+                ~sa.exists(analysis_exists),
+                NewsItem.published_at.is_not(None),
+                NewsItem.published_at < cutoff,
+            )
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def delete_stale_without_analysis(self, *, cutoff: datetime) -> int:
+        """Delete unanalyzed news rows older than the provided cutoff timestamp."""
+        analysis_exists = (
+            sa.select(sa.literal(1))
+            .select_from(Analysis)
+            .where(Analysis.news_item_id == NewsItem.id)
+        )
+        stmt = (
+            sa.delete(NewsItem)
+            .where(
+                ~sa.exists(analysis_exists),
+                NewsItem.published_at.is_not(None),
+                NewsItem.published_at < cutoff,
+            )
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return int(result.rowcount or 0)

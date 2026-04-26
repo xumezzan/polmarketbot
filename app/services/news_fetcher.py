@@ -14,14 +14,18 @@ from app.config import Settings, get_settings
 from app.database import AsyncSessionLocal
 from app.logging_utils import configure_logging, log_event
 from app.repositories.news_repo import NewsRepository
+from app.repositories.runtime_flag_repo import RuntimeFlagRepository
 from app.schemas.news import NewsApiArticle, NewsApiResponse, NewsImportResult
+from app.runtime_flags import (
+    RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL,
+    RUNTIME_FLAG_NEWSAPI_NEXT_ALLOWED_FETCH_AT,
+)
 from app.services.news_normalizer import NewsNormalizer
 from app.services.retry_utils import retry_async
 
 
 logger = logging.getLogger(__name__)
-_NEWSAPI_COOLDOWN_UNTIL: datetime | None = None
-_NEWSAPI_NEXT_ALLOWED_FETCH_AT: datetime | None = None
+_RSS_USER_AGENT = "PolymarketNewsBot/1.0 (+https://example.com/rss-ingest)"
 
 
 class NewsClientProtocol(Protocol):
@@ -40,13 +44,19 @@ class NewsApiError(Exception):
 class NewsApiClient:
     """Thin adapter around the official NewsAPI Everything endpoint."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        runtime_flag_repository: RuntimeFlagRepository,
+    ) -> None:
         self.settings = settings
+        self.runtime_flag_repository = runtime_flag_repository
         self.source_mode = "newsapi"
 
     async def fetch_latest(self) -> list[NewsApiArticle]:
         now = datetime.now(UTC)
-        cooldown_status = _get_newsapi_cooldown_status(now=now)
+        cooldown_status = await self._get_newsapi_cooldown_status(now=now)
         if cooldown_status is not None:
             cooldown_until, remaining_seconds = cooldown_status
             log_event(
@@ -61,7 +71,7 @@ class NewsApiClient:
         if not self.settings.news_api_key:
             raise NewsApiError("NEWS_API_KEY is required when NEWS_FETCH_MODE=newsapi")
 
-        min_interval_status = _get_newsapi_min_fetch_interval_status(now=now)
+        min_interval_status = await self._get_newsapi_min_fetch_interval_status(now=now)
         if min_interval_status is not None:
             next_allowed_at, remaining_seconds = min_interval_status
             log_event(
@@ -74,7 +84,7 @@ class NewsApiClient:
             )
             return []
 
-        _set_newsapi_next_allowed_fetch(
+        await self._set_newsapi_next_allowed_fetch(
             now=now,
             min_interval_minutes=self.settings.news_min_fetch_interval_minutes,
         )
@@ -130,8 +140,7 @@ class NewsApiClient:
         from_dt = now - timedelta(hours=lookback_hours)
         url = f"{self.settings.news_api_base_url.rstrip('/')}/everything"
 
-        import random
-        page = random.randint(1, self.settings.news_max_pages)
+        page = 1
 
         params = {
             "q": self.settings.news_query,
@@ -186,7 +195,7 @@ class NewsApiClient:
                         retry_after_value=exc.response.headers.get("Retry-After"),
                         fallback_minutes=self.settings.news_rate_limit_cooldown_minutes,
                     )
-                    _set_newsapi_cooldown(cooldown_until)
+                    await self._set_newsapi_cooldown(cooldown_until)
                     log_event(
                         logger,
                         "news_api_rate_limit_cooldown_started",
@@ -214,6 +223,81 @@ class NewsApiClient:
                 payload.message or payload.code or "NewsAPI returned an error response"
             )
         return payload
+
+    async def _get_newsapi_cooldown_status(
+        self,
+        *,
+        now: datetime,
+    ) -> tuple[datetime, int] | None:
+        cooldown_until = await self._get_datetime_flag(
+            key=RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL
+        )
+        remaining_seconds = get_newsapi_cooldown_remaining_seconds(
+            cooldown_until=cooldown_until,
+            now=now,
+        )
+        if remaining_seconds is None:
+            if cooldown_until is not None:
+                await self.runtime_flag_repository.set_text(
+                    key=RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL,
+                    value=None,
+                )
+            return None
+
+        return cooldown_until, remaining_seconds
+
+    async def _get_newsapi_min_fetch_interval_status(
+        self,
+        *,
+        now: datetime,
+    ) -> tuple[datetime, int] | None:
+        next_allowed_at = await self._get_datetime_flag(
+            key=RUNTIME_FLAG_NEWSAPI_NEXT_ALLOWED_FETCH_AT
+        )
+        remaining_seconds = get_newsapi_fetch_interval_remaining_seconds(
+            next_allowed_at=next_allowed_at,
+            now=now,
+        )
+        if remaining_seconds is None:
+            if next_allowed_at is not None:
+                await self.runtime_flag_repository.set_text(
+                    key=RUNTIME_FLAG_NEWSAPI_NEXT_ALLOWED_FETCH_AT,
+                    value=None,
+                )
+            return None
+
+        return next_allowed_at, remaining_seconds
+
+    async def _set_newsapi_cooldown(self, cooldown_until: datetime) -> None:
+        await self.runtime_flag_repository.set_text(
+            key=RUNTIME_FLAG_NEWSAPI_COOLDOWN_UNTIL,
+            value=cooldown_until.isoformat(),
+        )
+
+    async def _set_newsapi_next_allowed_fetch(
+        self,
+        *,
+        now: datetime,
+        min_interval_minutes: int,
+    ) -> None:
+        next_allowed_fetch_at = resolve_newsapi_next_allowed_fetch_at(
+            now=now,
+            min_interval_minutes=min_interval_minutes,
+        )
+        await self.runtime_flag_repository.set_text(
+            key=RUNTIME_FLAG_NEWSAPI_NEXT_ALLOWED_FETCH_AT,
+            value=(
+                next_allowed_fetch_at.isoformat()
+                if next_allowed_fetch_at is not None
+                else None
+            ),
+        )
+
+    async def _get_datetime_flag(self, *, key: str) -> datetime | None:
+        raw_value = await self.runtime_flag_repository.get_text(key=key)
+        if raw_value is None:
+            return None
+        return _parse_persisted_datetime(raw_value)
 
 
 def _is_retryable_newsapi_exception(exc: Exception) -> bool:
@@ -280,54 +364,6 @@ def get_newsapi_fetch_interval_remaining_seconds(
     return remaining_seconds
 
 
-def _get_newsapi_cooldown_status(*, now: datetime) -> tuple[datetime, int] | None:
-    global _NEWSAPI_COOLDOWN_UNTIL
-
-    remaining_seconds = get_newsapi_cooldown_remaining_seconds(
-        cooldown_until=_NEWSAPI_COOLDOWN_UNTIL,
-        now=now,
-    )
-    if remaining_seconds is None:
-        _NEWSAPI_COOLDOWN_UNTIL = None
-        return None
-
-    return _NEWSAPI_COOLDOWN_UNTIL, remaining_seconds
-
-
-def _get_newsapi_min_fetch_interval_status(
-    *,
-    now: datetime,
-) -> tuple[datetime, int] | None:
-    global _NEWSAPI_NEXT_ALLOWED_FETCH_AT
-
-    remaining_seconds = get_newsapi_fetch_interval_remaining_seconds(
-        next_allowed_at=_NEWSAPI_NEXT_ALLOWED_FETCH_AT,
-        now=now,
-    )
-    if remaining_seconds is None:
-        _NEWSAPI_NEXT_ALLOWED_FETCH_AT = None
-        return None
-
-    return _NEWSAPI_NEXT_ALLOWED_FETCH_AT, remaining_seconds
-
-
-def _set_newsapi_cooldown(cooldown_until: datetime) -> None:
-    global _NEWSAPI_COOLDOWN_UNTIL
-    _NEWSAPI_COOLDOWN_UNTIL = cooldown_until
-
-
-def _set_newsapi_next_allowed_fetch(
-    *,
-    now: datetime,
-    min_interval_minutes: int,
-) -> None:
-    global _NEWSAPI_NEXT_ALLOWED_FETCH_AT
-    _NEWSAPI_NEXT_ALLOWED_FETCH_AT = resolve_newsapi_next_allowed_fetch_at(
-        now=now,
-        min_interval_minutes=min_interval_minutes,
-    )
-
-
 def _parse_retry_after_seconds(
     *,
     retry_after_value: str | None,
@@ -359,6 +395,9 @@ class StubNewsClient:
     source_mode = "stub"
 
     async def fetch_latest(self) -> list[NewsApiArticle]:
+        now = datetime.now(UTC).replace(microsecond=0)
+        bitcoin_published_at = (now - timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+        fed_published_at = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
         stub_payload = {
             "status": "ok",
             "totalResults": 3,
@@ -370,7 +409,7 @@ class StubNewsClient:
                     "description": "Traders react to a fresh ETF rumor in early trading.",
                     "url": "https://example.com/markets/bitcoin-rally?utm_source=test",
                     "urlToImage": "https://example.com/images/bitcoin.png",
-                    "publishedAt": "2026-04-13T09:00:00Z",
+                    "publishedAt": bitcoin_published_at,
                     "content": "Traders react to a fresh ETF rumor in early trading. [+128 chars]",
                 },
                 {
@@ -380,7 +419,7 @@ class StubNewsClient:
                     "description": "Risk assets wobble as a Fed official sounds cautious.",
                     "url": "https://example.com/macro/fed-signals-slower-cuts",
                     "urlToImage": None,
-                    "publishedAt": "2026-04-13T10:15:00Z",
+                    "publishedAt": fed_published_at,
                     "content": "Risk assets wobble as a Fed official sounds cautious.",
                 },
                 {
@@ -390,7 +429,7 @@ class StubNewsClient:
                     "description": "Traders react to a fresh ETF rumor in early trading.",
                     "url": "https://example.com/markets/bitcoin-rally",
                     "urlToImage": "https://example.com/images/bitcoin.png",
-                    "publishedAt": "2026-04-13T09:00:00Z",
+                    "publishedAt": bitcoin_published_at,
                     "content": "Traders react to a fresh ETF rumor in early trading. [+128 chars]",
                 },
             ],
@@ -428,7 +467,11 @@ class RssNewsClient:
             return []
 
         all_articles: list[NewsApiArticle] = []
-        async with httpx.AsyncClient(timeout=self.settings.rss_request_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.settings.rss_request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": _RSS_USER_AGENT},
+        ) as client:
             for feed_url in feed_urls:
                 try:
                     response = await client.get(feed_url)
@@ -579,7 +622,11 @@ class NewsIngestionService:
         return result
 
 
-def build_news_client(settings: Settings) -> NewsClientProtocol:
+def build_news_client(
+    settings: Settings,
+    *,
+    runtime_flag_repository: RuntimeFlagRepository,
+) -> NewsClientProtocol:
     """Return either the stub client or the real NewsAPI client."""
     mode = settings.news_fetch_mode.lower()
 
@@ -590,7 +637,10 @@ def build_news_client(settings: Settings) -> NewsClientProtocol:
         return RssNewsClient(settings)
 
     if mode == "newsapi":
-        primary = NewsApiClient(settings)
+        primary = NewsApiClient(
+            settings,
+            runtime_flag_repository=runtime_flag_repository,
+        )
         if settings.news_fallback_mode.lower() == "rss":
             return FallbackNewsClient(
                 primary=primary,
@@ -858,13 +908,32 @@ def _parse_source_patterns(value: str) -> list[str]:
 async def run_news_ingestion(session: AsyncSession, settings: Settings) -> NewsImportResult:
     """Run one news import cycle."""
     repository = NewsRepository(session)
+    runtime_flag_repository = RuntimeFlagRepository(session)
     service = NewsIngestionService(
-        client=build_news_client(settings),
+        client=build_news_client(
+            settings,
+            runtime_flag_repository=runtime_flag_repository,
+        ),
         normalizer=NewsNormalizer(settings=settings),
         repository=repository,
         source_mode=settings.news_fetch_mode.lower(),
     )
     return await service.run()
+
+
+def _parse_persisted_datetime(value: str) -> datetime | None:
+    """Parse an ISO 8601 string from the runtime_flags table."""
+    normalized = value.strip().replace("Z", "+00:00")
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
 
 
 async def _main() -> None:

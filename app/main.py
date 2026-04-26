@@ -9,18 +9,25 @@ from app.config import get_settings
 from app.database import get_db_session
 from app.logging_utils import log_event
 from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.reconciliation_repo import ReconciliationRepository
+from app.repositories.live_trade_repo import LiveTradeRepository
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
 from app.repositories.runtime_flag_repo import RuntimeFlagRepository
 from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
-from app.runtime_flags import RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH
+from app.runtime_flags import (
+    RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH,
+    RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH,
+)
 from app.schemas.admin import (
     AdminPaperStatsResponse,
     AdminStatusResponse,
     KillSwitchStatus,
     OpenPositionsResponse,
+    ProofOfEdgeResponse,
+    SignalAuditResponse,
     RecentSignalsResponse,
 )
 from app.services.alerting import AlertingService, build_alert_client, get_alerting_runtime_status
@@ -29,6 +36,8 @@ from app.services.operator import OperatorService
 from app.schemas.monitor import SystemVerificationReport
 from app.schemas.telegram import TelegramUpdate
 from app.services.telegram_bot import TelegramBotService
+from app.schemas.live_execution import ReconciliationResult
+from app.services.reconciliation import ReconciliationService
 
 
 settings = get_settings()
@@ -44,6 +53,7 @@ def _build_operator_service(session: AsyncSession) -> OperatorService:
         analysis_repository=AnalysisRepository(session),
         signal_repository=SignalRepository(session),
         trade_repository=TradeRepository(session),
+        live_trade_repository=LiveTradeRepository(session),
         runtime_flag_repository=RuntimeFlagRepository(session),
         operator_state_repository=OperatorStateRepository(session),
         scheduler_cycle_repository=SchedulerCycleRepository(session),
@@ -96,6 +106,20 @@ async def admin_recent_signals(
     return await service.get_recent_signals(limit=limit)
 
 
+@app.get("/admin/signals/audit", response_model=SignalAuditResponse)
+async def admin_signal_audit(
+    limit: int = Query(
+        default=settings.operator_recent_signals_default_limit,
+        ge=1,
+        le=settings.operator_recent_signals_max_limit,
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> SignalAuditResponse:
+    """Return detailed news->market->risk audit rows for recent signals."""
+    service = _build_operator_service(session)
+    return await service.get_signal_audit(limit=limit)
+
+
 @app.get("/admin/positions/open", response_model=OpenPositionsResponse)
 async def admin_open_positions(
     session: AsyncSession = Depends(get_db_session),
@@ -112,6 +136,16 @@ async def admin_paper_stats(
     """Return compact paper-trading statistics."""
     service = _build_operator_service(session)
     return await service.get_paper_stats()
+
+
+@app.get("/admin/paper/proof-of-edge", response_model=ProofOfEdgeResponse)
+async def admin_proof_of_edge(
+    window_days: int = Query(default=7, ge=3, le=30),
+    session: AsyncSession = Depends(get_db_session),
+) -> ProofOfEdgeResponse:
+    """Return phase-1 proof-of-edge gate report."""
+    service = _build_operator_service(session)
+    return await service.get_proof_of_edge_report(window_days=window_days)
 
 
 @app.get("/admin/verify", response_model=SystemVerificationReport)
@@ -160,6 +194,51 @@ async def kill_switch_off(
 ) -> KillSwitchStatus:
     """Disable kill switch: allow opening new paper trades."""
     return await _set_kill_switch(session=session, enabled=False)
+
+
+@app.get("/admin/live/kill-switch/status", response_model=KillSwitchStatus)
+async def live_kill_switch_status(
+    session: AsyncSession = Depends(get_db_session),
+) -> KillSwitchStatus:
+    """Return live-trading kill switch status."""
+    repository = RuntimeFlagRepository(session)
+    enabled, updated_at = await repository.get_status(
+        key=RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH,
+        default=False,
+    )
+    return KillSwitchStatus(
+        enabled=enabled,
+        key=RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH,
+        updated_at=updated_at.isoformat() if updated_at is not None else None,
+    )
+
+
+@app.post("/admin/live/kill-switch/on", response_model=KillSwitchStatus)
+async def live_kill_switch_on(
+    session: AsyncSession = Depends(get_db_session),
+) -> KillSwitchStatus:
+    """Enable live kill switch."""
+    return await _set_live_kill_switch(session=session, enabled=True)
+
+
+@app.post("/admin/live/kill-switch/off", response_model=KillSwitchStatus)
+async def live_kill_switch_off(
+    session: AsyncSession = Depends(get_db_session),
+) -> KillSwitchStatus:
+    """Disable live kill switch."""
+    return await _set_live_kill_switch(session=session, enabled=False)
+
+
+@app.post("/admin/live/reconcile", response_model=ReconciliationResult)
+async def live_reconcile(
+    session: AsyncSession = Depends(get_db_session),
+) -> ReconciliationResult:
+    """Run phase-4 live reconciliation and update circuit breaker state."""
+    service = ReconciliationService(
+        reconciliation_repository=ReconciliationRepository(session),
+        runtime_flag_repository=RuntimeFlagRepository(session),
+    )
+    return await service.run(session=session, settings=settings)
 
 
 @app.post("/telegram/webhook")
@@ -229,6 +308,43 @@ async def _set_kill_switch(
         log_event(
             logger,
             "kill_switch_alert_failed",
+            enabled=enabled,
+            error=str(exc),
+        )
+
+    return KillSwitchStatus(
+        enabled=bool(flag.bool_value),
+        key=flag.key,
+        updated_at=flag.updated_at.isoformat(),
+    )
+
+
+async def _set_live_kill_switch(
+    *,
+    session: AsyncSession,
+    enabled: bool,
+    source: str = "admin_api",
+) -> KillSwitchStatus:
+    repository = RuntimeFlagRepository(session)
+    flag = await repository.set_bool(
+        key=RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH,
+        value=enabled,
+    )
+
+    try:
+        alerting_service = AlertingService(
+            settings=settings,
+            client=build_alert_client(settings),
+        )
+        await alerting_service.send_live_kill_switch_changed(
+            enabled=enabled,
+            changed_at=flag.updated_at.isoformat(),
+            source=source,
+        )
+    except Exception as exc:
+        log_event(
+            logger,
+            "live_kill_switch_alert_failed",
             enabled=enabled,
             error=str(exc),
         )

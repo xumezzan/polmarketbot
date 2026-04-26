@@ -95,6 +95,17 @@ def test_select_exit_market_price_uses_no_price_for_no_side() -> None:
     assert current_price == 0.37
 
 
+def test_select_exit_market_price_uses_inverse_last_trade_for_no_side() -> None:
+    current_price = select_exit_market_price(
+        side="NO",
+        yes_price=None,
+        no_price=None,
+        last_trade_price=0.63,
+    )
+
+    assert current_price == 0.37
+
+
 def test_build_paper_trade_analytics_returns_daily_market_and_source_breakdowns() -> None:
     analytics = build_paper_trade_analytics(
         generated_at="2026-04-13T12:00:00+00:00",

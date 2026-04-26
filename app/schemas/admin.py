@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 
+from app.schemas.trade import PaperTradePhaseGateReport
 from app.schemas.trade import PaperTradeStats
 
 
@@ -27,13 +28,21 @@ class AdminStatusResponse(BaseModel):
     signals_count: int = 0
     paper_trades_count: int = 0
     open_positions_count: int = 0
+    live_orders_count: int = 0
+    live_open_positions_count: int = 0
+    execution_mode: str = "paper"
+    live_trading_enabled: bool = False
     kill_switch_enabled: bool = False
+    live_kill_switch_enabled: bool = False
+    live_circuit_breaker_enabled: bool = False
     fetched_news_24h: int = 0
     scheduler_cycles_24h: int = 0
     failed_cycles_24h: int = 0
     provider_cooldowns: dict[str, dict[str, object]] = Field(default_factory=dict)
     inserted_news_24h: int = 0
     analyses_count_24h: int = 0
+    llm_tokens_24h: int = 0
+    llm_cost_24h: float = 0.0
     signals_count_24h: int = 0
     opened_trades_24h: int = 0
     closed_trades_24h: int = 0
@@ -62,6 +71,48 @@ class RecentSignalsResponse(BaseModel):
     limit: int
     count: int
     items: list[RecentSignalItem] = Field(default_factory=list)
+
+
+class SignalAuditItem(BaseModel):
+    """Operator-friendly audit row for one signal and its linked snapshots."""
+
+    signal_id: int
+    created_at: str
+    analysis_id: int
+    news_item_id: int
+    news_title: str
+    news_source: str
+    news_published_at: str | None = None
+    market_query: str
+    llm_reason: str
+    direction: str
+    confidence: float
+    relevance: float
+    market_id: str
+    market_question: str | None = None
+    signal_status: str
+    edge: float
+    market_price: float
+    fair_probability: float
+    candidate_count: int | None = None
+    match_score: float | None = None
+    match_reasons: list[str] = Field(default_factory=list)
+    liquidity: float | None = None
+    best_bid: float | None = None
+    best_ask: float | None = None
+    top_candidate_score_delta: float | None = None
+    risk_allow: bool | None = None
+    risk_blockers: list[str] = Field(default_factory=list)
+    approved_size_usd: float | None = None
+
+
+class SignalAuditResponse(BaseModel):
+    """Detailed signal audit response for manual review."""
+
+    generated_at: str
+    limit: int
+    count: int
+    items: list[SignalAuditItem] = Field(default_factory=list)
 
 
 class OpenPositionItem(BaseModel):
@@ -94,3 +145,10 @@ class AdminPaperStatsResponse(BaseModel):
 
     generated_at: str
     stats: PaperTradeStats
+
+
+class ProofOfEdgeResponse(BaseModel):
+    """Proof-of-edge phase-gate response."""
+
+    generated_at: str
+    report: PaperTradePhaseGateReport

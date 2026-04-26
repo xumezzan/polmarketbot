@@ -120,6 +120,42 @@ class TradeRepository:
         stmt = self._trade_with_context().order_by(PaperTrade.id.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars().all())
 
+    async def list_recent_closed_trades(self, *, limit: int = 10) -> list[PaperTrade]:
+        """Return latest closed paper trades with context."""
+        stmt = (
+            self._trade_with_context()
+            .where(PaperTrade.status == TradeStatus.CLOSED)
+            .order_by(PaperTrade.closed_at.desc().nullslast(), PaperTrade.id.desc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_top_closed_trades(
+        self,
+        *,
+        limit: int = 5,
+        descending: bool = True,
+        since: datetime | None = None,
+    ) -> list[PaperTrade]:
+        """Return best or worst closed trades by realized PnL."""
+        order_column = PaperTrade.pnl.desc() if descending else PaperTrade.pnl.asc()
+        conditions: list[sa.ColumnElement[bool]] = [
+            PaperTrade.status == TradeStatus.CLOSED,
+            PaperTrade.pnl.is_not(None),
+        ]
+        if since is not None:
+            conditions.append(
+                PaperTrade.closed_at.is_not(None),
+            )
+            conditions.append(PaperTrade.closed_at >= since)
+        stmt = (
+            self._trade_with_context()
+            .where(*conditions)
+            .order_by(order_column, PaperTrade.closed_at.desc().nullslast(), PaperTrade.id.desc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def count_open_positions(self) -> int:
         """Return the current number of open paper positions."""
         stmt = sa.select(sa.func.count()).select_from(Position).where(
@@ -219,15 +255,24 @@ class TradeRepository:
         exit_price: float,
         pnl: float,
         closed_at: datetime,
+        close_reason: str | None = None,
+        resolution_outcome: str | None = None,
+        resolved_at: datetime | None = None,
     ) -> tuple[Position, PaperTrade]:
         """Close one open position and its linked paper trade."""
         position.status = PositionStatus.CLOSED
         position.closed_at = closed_at
+        position.close_reason = close_reason
+        position.resolution_outcome = resolution_outcome
+        position.resolved_at = resolved_at
 
         trade.exit_price = exit_price
         trade.pnl = pnl
         trade.status = TradeStatus.CLOSED
         trade.closed_at = closed_at
+        trade.close_reason = close_reason
+        trade.resolution_outcome = resolution_outcome
+        trade.resolved_at = resolved_at
 
         await self.session.commit()
         await self.session.refresh(position)

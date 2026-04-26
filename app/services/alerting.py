@@ -10,6 +10,7 @@ from app.config import Settings, get_settings
 from app.logging_utils import configure_logging, log_event
 from app.schemas.daily_report import DailyReport
 from app.schemas.alert import AlertDispatchResult, AlertMessage
+from app.schemas.live_execution import LiveOrderResult
 from app.schemas.scheduler import PipelineItemResult, SchedulerCycleResult
 from app.schemas.trade import PaperTradeCloseResult, PaperTradeOpenResult
 
@@ -186,6 +187,71 @@ class AlertingService:
                 "market_id": trade.market_id,
                 "trade_id": trade.trade_id,
                 "position_id": trade.position_id,
+            },
+        )
+        return await self._deliver(alert)
+
+    async def send_live_order_placed(
+        self,
+        *,
+        cycle_id: str,
+        result: LiveOrderResult,
+    ) -> AlertDispatchResult:
+        if not self.settings.alert_on_trade_opened:
+            return self._skipped_result("live_order_placed_alert", "alert_on_trade_opened=false")
+
+        alert = AlertMessage(
+            event="live_order_placed_alert",
+            level="WARNING",
+            title="Live Order Placed",
+            text="\n".join(
+                [
+                    "<b>Live Order Placed</b>",
+                    f"cycle_id=<code>{html.escape(cycle_id)}</code>",
+                    f"signal_id=<code>{result.intent.signal_id}</code>",
+                    f"market_id=<code>{html.escape(result.intent.market_id)}</code>",
+                    f"side=<b>{html.escape(result.intent.side)}</b>",
+                    f"size_usd=<code>{result.intent.target_size_usd:.2f}</code>",
+                    f"price=<code>{result.intent.requested_price:.4f}</code>",
+                    f"status=<code>{html.escape(result.order_status)}</code>",
+                    f"exchange_order_id=<code>{html.escape(result.exchange_order_id or 'n/a')}</code>",
+                ]
+            ),
+            context={
+                "cycle_id": cycle_id,
+                "signal_id": result.intent.signal_id,
+                "market_id": result.intent.market_id,
+                "live_order_id": result.live_order_id,
+                "live_position_id": result.live_position_id,
+            },
+        )
+        return await self._deliver(alert)
+
+    async def send_live_order_failed(
+        self,
+        *,
+        cycle_id: str,
+        signal_id: int,
+        market_id: str,
+        error: str,
+    ) -> AlertDispatchResult:
+        alert = AlertMessage(
+            event="live_order_failed_alert",
+            level="ERROR",
+            title="Live Order Failed",
+            text="\n".join(
+                [
+                    "<b>Live Order Failed</b>",
+                    f"cycle_id=<code>{html.escape(cycle_id)}</code>",
+                    f"signal_id=<code>{signal_id}</code>",
+                    f"market_id=<code>{html.escape(market_id)}</code>",
+                    f"error=<code>{html.escape(error[:1000])}</code>",
+                ]
+            ),
+            context={
+                "cycle_id": cycle_id,
+                "signal_id": signal_id,
+                "market_id": market_id,
             },
         )
         return await self._deliver(alert)
@@ -420,6 +486,35 @@ class AlertingService:
             text="\n".join(
                 [
                     "<b>Paper Trading Kill Switch Changed</b>",
+                    f"state=<b>{state}</b>",
+                    f"changed_at=<code>{html.escape(changed_at)}</code>",
+                    f"source=<code>{html.escape(source)}</code>",
+                ]
+            ),
+            context={
+                "enabled": enabled,
+                "changed_at": changed_at,
+                "source": source,
+            },
+        )
+        return await self._deliver(alert)
+
+    async def send_live_kill_switch_changed(
+        self,
+        *,
+        enabled: bool,
+        changed_at: str,
+        source: str,
+    ) -> AlertDispatchResult:
+        event_name = "live_kill_switch_on_alert" if enabled else "live_kill_switch_off_alert"
+        state = "ON" if enabled else "OFF"
+        alert = AlertMessage(
+            event=event_name,
+            level="WARNING" if enabled else "INFO",
+            title="Live Trading Kill Switch Changed",
+            text="\n".join(
+                [
+                    "<b>Live Trading Kill Switch Changed</b>",
                     f"state=<b>{state}</b>",
                     f"changed_at=<code>{html.escape(changed_at)}</code>",
                     f"source=<code>{html.escape(source)}</code>",

@@ -38,6 +38,8 @@ class DailyReport(BaseModel):
     last_successful_cycle_at: str | None = None
     inserted_news_24h: int = 0
     analyses_count_24h: int = 0
+    llm_tokens_24h: int = 0
+    llm_cost_24h: float = 0.0
     signals_count_24h: int = 0
     actionable_signals_count_24h: int = 0
     approved_signals_count_24h: int = 0

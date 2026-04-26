@@ -17,6 +17,11 @@ class RuntimeFlag(Base):
         nullable=False,
         server_default=sa.false(),
     )
+    text_value: Mapped[str | None] = mapped_column(
+        sa.String(500),
+        nullable=True,
+        server_default=None,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,

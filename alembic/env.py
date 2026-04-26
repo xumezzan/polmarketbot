@@ -1,6 +1,7 @@
 from logging.config import fileConfig
 
 from alembic import context
+from sqlalchemy import text
 from sqlalchemy import engine_from_config, pool
 
 from app.config import get_settings
@@ -17,6 +18,36 @@ if config.config_file_name is not None:
 config.set_main_option("sqlalchemy.url", settings.database_sync_url)
 
 target_metadata = Base.metadata
+
+
+def _ensure_version_table_capacity(connection) -> None:
+    """Widen alembic_version.version_num for long revision identifiers."""
+    connection.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.tables WHERE table_name = 'alembic_version'
+                ) THEN
+                    CREATE TABLE alembic_version (
+                        version_num VARCHAR(255) PRIMARY KEY
+                    );
+                ELSIF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = 'alembic_version'
+                      AND column_name = 'version_num'
+                      AND character_maximum_length IS NOT NULL
+                      AND character_maximum_length < 255
+                ) THEN
+                    ALTER TABLE alembic_version
+                    ALTER COLUMN version_num TYPE VARCHAR(255);
+                END IF;
+            END $$;
+            """
+        )
+    )
 
 
 def run_migrations_offline() -> None:
@@ -43,6 +74,9 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        _ensure_version_table_capacity(connection)
+        if connection.in_transaction():
+            connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

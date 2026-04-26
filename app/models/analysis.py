@@ -40,6 +40,12 @@ class Analysis(TimestampMixin, Base):
     fair_probability: Mapped[float] = mapped_column(sa.Numeric(5, 4), nullable=False)
     market_query: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     reason: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    llm_provider: Mapped[str | None] = mapped_column(sa.String(50), nullable=True)
+    llm_model: Mapped[str | None] = mapped_column(sa.String(100), nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(sa.Numeric(12, 6), nullable=True)
     raw_response: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     news_item: Mapped["NewsItem"] = relationship(back_populates="analyses")

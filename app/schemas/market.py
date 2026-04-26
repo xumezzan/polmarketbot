@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -47,6 +48,22 @@ class GammaMarketEvent(BaseModel):
     closed: bool | None = None
 
 
+class GammaFeeSchedule(BaseModel):
+    """Subset of fee schedule fields exposed by Gamma."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    exponent: int | None = None
+    rate: float | None = None
+    taker_only: bool | None = Field(default=None, alias="takerOnly")
+    rebate_rate: float | None = Field(default=None, alias="rebateRate")
+
+    @field_validator("rate", "rebate_rate", mode="before")
+    @classmethod
+    def parse_numeric_fields(cls, value: Any) -> float | None:
+        return _parse_optional_float(value)
+
+
 class GammaMarket(BaseModel):
     """Normalized Polymarket Gamma market."""
 
@@ -60,6 +77,10 @@ class GammaMarket(BaseModel):
     slug: str | None = None
     condition_id: str | None = Field(default=None, alias="conditionId")
     description: str | None = None
+    resolution_source: str | None = Field(default=None, alias="resolutionSource")
+    category: str | None = None
+    start_date: datetime | None = Field(default=None, alias="startDate")
+    end_date: datetime | None = Field(default=None, alias="endDate")
     active: bool | None = None
     closed: bool | None = None
     archived: bool | None = None
@@ -69,13 +90,26 @@ class GammaMarket(BaseModel):
     best_bid: float | None = Field(default=None, alias="bestBid")
     best_ask: float | None = Field(default=None, alias="bestAsk")
     last_trade_price: float | None = Field(default=None, alias="lastTradePrice")
+    fees_enabled: bool | None = Field(default=None, alias="feesEnabled")
+    taker_base_fee: float | None = Field(default=None, alias="takerBaseFee")
+    maker_base_fee: float | None = Field(default=None, alias="makerBaseFee")
+    fee_schedule: GammaFeeSchedule | None = Field(default=None, alias="feeSchedule")
     outcomes: list[str] = Field(default_factory=list)
     outcome_prices: list[float] = Field(default_factory=list, alias="outcomePrices")
     clob_token_ids: list[str] = Field(default_factory=list, alias="clobTokenIds")
     events: list[GammaMarketEvent] = Field(default_factory=list)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("liquidity", "volume", "best_bid", "best_ask", "last_trade_price", mode="before")
+    @field_validator(
+        "liquidity",
+        "volume",
+        "best_bid",
+        "best_ask",
+        "last_trade_price",
+        "taker_base_fee",
+        "maker_base_fee",
+        mode="before",
+    )
     @classmethod
     def parse_numeric_fields(cls, value: Any) -> float | None:
         return _parse_optional_float(value)
@@ -122,6 +156,26 @@ class GammaMarket(BaseModel):
     def no_token_id(self) -> str | None:
         return self._token_for_outcome("no")
 
+    @property
+    def effective_taker_fee_rate(self) -> float:
+        if self.fees_enabled is False:
+            return 0.0
+
+        if self.taker_base_fee is not None:
+            return _normalize_fee_rate(self.taker_base_fee)
+
+        if self.fee_schedule is None or self.fee_schedule.rate is None:
+            return 0.0
+
+        rate = float(self.fee_schedule.rate)
+        exponent = self.fee_schedule.exponent
+        if exponent is not None and exponent > 0 and rate > 1:
+            normalized = rate / (10**exponent)
+            if 0 <= normalized <= 1:
+                return normalized
+
+        return _normalize_fee_rate(rate)
+
     def _price_for_outcome(self, outcome_name: str) -> float | None:
         for outcome, price in zip(self.outcomes, self.outcome_prices, strict=False):
             if outcome.lower() == outcome_name:
@@ -156,6 +210,8 @@ class MarketCandidate(BaseModel):
     last_trade_price: float | None = None
     liquidity: float | None = None
     volume: float | None = None
+    fees_enabled: bool | None = None
+    effective_taker_fee_rate: float | None = None
     match_score: float = Field(ge=0)
     match_reasons: list[str] = Field(default_factory=list)
     score_breakdown: dict[str, float] = Field(default_factory=dict)
@@ -174,3 +230,11 @@ class MarketMatchResult(BaseModel):
     fetched_count: int
     candidate_count: int
     candidates: list[MarketCandidate]
+
+
+def _normalize_fee_rate(value: float) -> float:
+    if value <= 0:
+        return 0.0
+    if value <= 1:
+        return round(value, 6)
+    return round(value / 10000, 6)

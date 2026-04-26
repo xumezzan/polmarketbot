@@ -93,6 +93,12 @@ class AnalysisRepository:
         news_item_id: int,
         verdict: Verdict,
         raw_response: dict[str, object] | None,
+        llm_provider: str | None = None,
+        llm_model: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        estimated_cost_usd: float | None = None,
     ) -> Analysis:
         """Insert a new analysis row and commit it."""
         analysis = Analysis(
@@ -103,12 +109,42 @@ class AnalysisRepository:
             fair_probability=verdict.fair_probability,
             market_query=verdict.market_query,
             reason=verdict.reason,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=estimated_cost_usd,
             raw_response=raw_response,
         )
         self.session.add(analysis)
         await self.session.commit()
         await self.session.refresh(analysis)
         return analysis
+
+    async def sum_estimated_cost_since(self, *, since: datetime) -> float:
+        """Return total estimated LLM cost since a timestamp."""
+        stmt = (
+            sa.select(sa.func.coalesce(sa.func.sum(Analysis.estimated_cost_usd), 0))
+            .select_from(Analysis)
+            .where(
+                Analysis.created_at >= since,
+                Analysis.estimated_cost_usd.is_not(None),
+            )
+        )
+        return float((await self.session.execute(stmt)).scalar_one())
+
+    async def sum_total_tokens_since(self, *, since: datetime) -> int:
+        """Return total LLM tokens spent since a timestamp."""
+        stmt = (
+            sa.select(sa.func.coalesce(sa.func.sum(Analysis.total_tokens), 0))
+            .select_from(Analysis)
+            .where(
+                Analysis.created_at >= since,
+                Analysis.total_tokens.is_not(None),
+            )
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
 
     async def save_market_matching_snapshot(
         self,
@@ -187,6 +223,33 @@ class AnalysisRepository:
         paper_snapshot["updated_at"] = action.get("action_at")
         paper_snapshot["actions"] = actions
         snapshots["paper_trader"] = paper_snapshot
+        raw_response["snapshots"] = snapshots
+
+        analysis.raw_response = raw_response
+        await self.session.commit()
+        await self.session.refresh(analysis)
+        return analysis
+
+    async def save_execution_action(
+        self,
+        *,
+        analysis_id: int,
+        action: dict[str, object],
+    ) -> Analysis:
+        """Append one shadow/live execution audit action."""
+        analysis = await self.get_by_id(analysis_id)
+        if analysis is None:
+            raise ValueError(f"Analysis {analysis_id} not found.")
+
+        raw_response = dict(analysis.raw_response or {})
+        snapshots = dict(raw_response.get("snapshots") or {})
+        execution_snapshot = dict(snapshots.get("execution") or {})
+        actions = list(execution_snapshot.get("actions") or [])
+        actions.append(action)
+
+        execution_snapshot["updated_at"] = action.get("action_at")
+        execution_snapshot["actions"] = actions
+        snapshots["execution"] = execution_snapshot
         raw_response["snapshots"] = snapshots
 
         analysis.raw_response = raw_response

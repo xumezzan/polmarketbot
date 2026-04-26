@@ -13,8 +13,15 @@ class SignalEvaluation(BaseModel):
     market_question: str
     direction: str
     market_price: float
+    execution_price: float | None = None
+    raw_fair_probability: float | None = None
     fair_probability: float
+    raw_edge: float | None = None
     edge: float
+    estimated_fee_rate: float | None = None
+    estimated_fee_per_share: float | None = None
+    market_consensus_weight: float | None = None
+    calibration_sample_count: int | None = None
     signal_status: str
     explanation: str
     candidate: MarketCandidate

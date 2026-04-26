@@ -104,8 +104,9 @@ class RiskEngine:
         has_existing_position = await self.trade_repository.has_open_position_for_market(
             market_id=signal.market_id
         )
+        query_text = self._load_effective_market_query(signal)
         entity_tokens = _extract_query_entity_tokens(
-            query_text=analysis.market_query or "",
+            query_text=query_text,
             max_tokens=self.settings.risk_anchor_entity_max_tokens,
         )
         entity_key = _build_entity_key(entity_tokens)
@@ -119,12 +120,12 @@ class RiskEngine:
             self._load_market_match_score_context(signal)
         )
         overlap_count, max_overlap_token_length = _query_market_overlap_stats(
-            query_text=analysis.market_query or "",
+            query_text=query_text,
             market_question=candidate.question,
         )
         anchor_overlap_count, query_anchor_tokens = _query_market_anchor_stats(
             settings=self.settings,
-            query_text=analysis.market_query or "",
+            query_text=query_text,
             market_question=candidate.question,
         )
         bid_ask_spread = _resolve_bid_ask_spread(
@@ -146,7 +147,7 @@ class RiskEngine:
             liquidity=liquidity,
             edge=float(signal.edge),
             match_score=float(candidate.match_score),
-            query_text=analysis.market_query or "",
+            query_text=query_text,
             market_question=candidate.question,
             existing_open_position=has_existing_position,
             entity_key=entity_key,
@@ -276,6 +277,16 @@ class RiskEngine:
         raise RiskEngineError(
             f"Market candidate snapshot not found for signal_id={signal.id}, market_id={signal.market_id}."
         )
+
+    def _load_effective_market_query(self, signal: Signal) -> str:
+        analysis = signal.analysis
+        raw_response = analysis.raw_response or {}
+        snapshots = raw_response.get("snapshots") or {}
+        market_snapshot = snapshots.get("market_matching") or {}
+        normalized_query = market_snapshot.get("normalized_market_query")
+        if isinstance(normalized_query, str) and normalized_query.strip():
+            return normalized_query.strip()
+        return analysis.market_query or ""
 
     def _news_age_minutes(
         self,

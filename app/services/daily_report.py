@@ -72,6 +72,8 @@ class DailyReportService:
         )
         inserted_news = await self.news_repository.count_created_since(since=since)
         analyses = await self.analysis_repository.list_with_context(since=since)
+        llm_tokens = await self.analysis_repository.sum_total_tokens_since(since=since)
+        llm_cost = await self.analysis_repository.sum_estimated_cost_since(since=since)
         signals_count = await self.signal_repository.count_created_since(since=since)
         opened_trades = await self.trade_repository.count_opened_trades_since(since=since)
         closed_trades = await self.trade_repository.count_closed_trades_since(since=since)
@@ -125,6 +127,8 @@ class DailyReportService:
             ),
             inserted_news_24h=inserted_news,
             analyses_count_24h=len(analyses),
+            llm_tokens_24h=llm_tokens,
+            llm_cost_24h=round(llm_cost, 6),
             signals_count_24h=signals_count,
             actionable_signals_count_24h=actionable_signals,
             approved_signals_count_24h=approved_signals,
@@ -274,6 +278,8 @@ class DailyReportService:
                 return no_price
             if yes_price is not None:
                 return round(1 - yes_price, 4)
+            if last_trade_price is not None:
+                return round(1 - last_trade_price, 4)
             return None
 
         return None
