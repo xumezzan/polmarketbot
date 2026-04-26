@@ -3,6 +3,8 @@ from app.services.market_client import (
     KeywordMarketRanker,
     extract_market_domain_anchor_tokens,
     filter_markets_by_query_domain,
+    infer_market_contract_type,
+    market_contract_compatibility,
     normalize_market_query,
 )
 from tests.helpers import build_test_settings
@@ -198,3 +200,73 @@ def test_keyword_ranker_does_not_exact_match_single_asset_queries() -> None:
     candidates = ranker.rank(analysis=analysis, markets=markets)
 
     assert candidates[0].score_breakdown["exact_match"] == 0.0
+
+
+def test_infer_market_contract_type_separates_price_targets_from_performance() -> None:
+    assert infer_market_contract_type("bitcoin 100k december 2026") == "price_target"
+    assert (
+        infer_market_contract_type("Will Bitcoin have the best performance in 2026?")
+        == "relative_performance"
+    )
+    assert (
+        infer_market_contract_type("Bitcoin all time high by September 30, 2026?")
+        == "all_time_high"
+    )
+
+
+def test_market_contract_compatibility_rejects_wrong_bitcoin_contract_type() -> None:
+    market = GammaMarket.model_validate(
+        {
+            "id": "btc-performance",
+            "question": "Will Bitcoin have the best performance in 2026?",
+            "slug": "will-bitcoin-have-the-best-performance-in-2026",
+        }
+    )
+
+    assert (
+        market_contract_compatibility(
+            query_text="bitcoin 100k december 2026",
+            market=market,
+        )
+        == 0.0
+    )
+
+
+def test_keyword_ranker_skips_incompatible_contract_types() -> None:
+    ranker = KeywordMarketRanker(build_test_settings(market_match_min_score=0.0))
+    analysis = type(
+        "AnalysisStub",
+        (),
+        {
+            "id": 1,
+            "news_item_id": 1,
+            "market_query": "bitcoin 100k december 2026",
+        },
+    )()
+    markets = [
+        GammaMarket.model_validate(
+            {
+                "id": "btc-performance",
+                "question": "Will Bitcoin have the best performance in 2026?",
+                "slug": "will-bitcoin-have-the-best-performance-in-2026",
+            }
+        ),
+        GammaMarket.model_validate(
+            {
+                "id": "btc-ath",
+                "question": "Bitcoin all time high by September 30, 2026?",
+                "slug": "bitcoin-all-time-high-by-september-30-2026",
+            }
+        ),
+        GammaMarket.model_validate(
+            {
+                "id": "btc-100k",
+                "question": "Will Bitcoin reach $100,000 by December 31, 2026?",
+                "slug": "will-bitcoin-reach-100k-by-december-31-2026",
+            }
+        ),
+    ]
+
+    candidates = ranker.rank(analysis=analysis, markets=markets)
+
+    assert [candidate.market_id for candidate in candidates] == ["btc-100k"]

@@ -82,9 +82,9 @@ async def test_openai_llm_client_parses_structured_verdict(monkeypatch: pytest.M
     assert usage["prompt_tokens"] == 100
     assert usage["completion_tokens"] == 50
     assert usage["total_tokens"] == 150
-    assert usage["estimated_cost_usd"] == pytest.approx(0.000045)
+    assert usage["estimated_cost_usd"] == pytest.approx(0.0003)
     assert captured["response_format"] is Verdict
-    assert captured["model"] == "gpt-4o-mini"
+    assert captured["model"] == "gpt-5.4-mini"
 
 
 @pytest.mark.asyncio

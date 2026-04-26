@@ -45,12 +45,12 @@ class Settings(BaseSettings):
     llm_mode: str = "stub"
     llm_openai_fallback_mode: str = "stub"
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"
+    openai_model: str = "gpt-5.4-mini"
     openai_timeout_seconds: float = 30.0
     openai_temperature: float = 0.0
     openai_max_completion_tokens: int = 300
-    openai_input_cost_per_1m_tokens: float = 0.15
-    openai_output_cost_per_1m_tokens: float = 0.60
+    openai_input_cost_per_1m_tokens: float = 0.75
+    openai_output_cost_per_1m_tokens: float = 4.50
     openai_daily_budget_usd: float = 0.0
     llm_max_content_chars: int = 4000
     news_api_key: str = ""

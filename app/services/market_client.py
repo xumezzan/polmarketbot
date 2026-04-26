@@ -158,6 +158,25 @@ GENERIC_DOMAIN_TOKENS = {
     "polymarket",
 }
 
+PRICE_TARGET_MARKET_TOKENS = {
+    "above",
+    "below",
+    "hit",
+    "reach",
+    "reaches",
+    "reaching",
+}
+
+RELATIVE_PERFORMANCE_TOKENS = {
+    "beat",
+    "beats",
+    "best",
+    "outperform",
+    "outperforms",
+    "performance",
+    "perform",
+}
+
 
 class MarketClientError(Exception):
     """Raised when market fetching or matching fails."""
@@ -478,11 +497,19 @@ class KeywordMarketRanker:
 
         ranked: list[MarketCandidate] = []
         for market in markets:
+            contract_compatibility = market_contract_compatibility(
+                query_text=query_phrase,
+                market=market,
+            )
+            if contract_compatibility <= 0:
+                continue
+
             candidate = self._score_market(
                 analysis=analysis,
                 market=market,
                 query_tokens=query_tokens,
                 query_phrase=query_phrase,
+                contract_compatibility=contract_compatibility,
             )
             if candidate is not None:
                 ranked.append(candidate)
@@ -497,6 +524,7 @@ class KeywordMarketRanker:
         market: GammaMarket,
         query_tokens: set[str],
         query_phrase: str,
+        contract_compatibility: float,
     ) -> MarketCandidate | None:
         question_tokens = _tokenize(market.question)
         slug_tokens = _tokenize(market.slug or "")
@@ -521,7 +549,8 @@ class KeywordMarketRanker:
             "event_overlap": event_overlap * self.settings.market_match_event_weight,
             "liquidity_bonus": liquidity_bonus * self.settings.market_match_liquidity_weight,
         }
-        total_score = round(sum(score_breakdown.values()), 6)
+        raw_score = sum(score_breakdown.values())
+        total_score = round(raw_score * contract_compatibility, 6)
 
         if total_score < self.settings.market_match_min_score:
             return None
@@ -537,6 +566,8 @@ class KeywordMarketRanker:
             reasons.append(f"event token overlap={event_overlap:.2f}")
         if liquidity_bonus:
             reasons.append(f"liquidity bonus={liquidity_bonus:.2f}")
+        if contract_compatibility < 1:
+            reasons.append(f"contract type compatibility={contract_compatibility:.2f}")
 
         return MarketCandidate(
             analysis_id=analysis.id,
@@ -763,6 +794,53 @@ def filter_markets_by_query_domain(
         if _market_domain_tokens(market) & anchor_tokens
     ]
     return filtered
+
+
+def market_contract_compatibility(*, query_text: str, market: GammaMarket) -> float:
+    """Return 0 when query and market describe incompatible contract types."""
+    query_type = infer_market_contract_type(query_text)
+    market_type = infer_market_contract_type(
+        " ".join(
+            part
+            for part in (
+                market.question,
+                market.slug or "",
+                market.event_title or "",
+                market.event_slug or "",
+            )
+            if part
+        )
+    )
+
+    if query_type == "generic" or market_type == "generic":
+        return 1.0
+    if query_type == market_type:
+        return 1.0
+    return 0.0
+
+
+def infer_market_contract_type(value: str) -> str:
+    """Classify the kind of binary market implied by text."""
+    lowered = (value or "").lower()
+    tokens = _tokenize(lowered)
+
+    if "all-time high" in lowered or "all time high" in lowered:
+        return "all_time_high"
+    if tokens & RELATIVE_PERFORMANCE_TOKENS:
+        return "relative_performance"
+    if _extract_price_target(lowered) is not None and (
+        tokens & PRICE_TARGET_MARKET_TOKENS or _detect_primary_asset(lowered) is not None
+    ):
+        return "price_target"
+    if (
+        _contains_phrase(lowered, "rate cut")
+        or _contains_phrase(lowered, "rate cuts")
+        or tokens & {"fomc", "fed"}
+        and tokens & {"cut", "cuts", "rate", "rates"}
+    ):
+        return "rate_cut"
+
+    return "generic"
 
 
 def extract_market_domain_anchor_tokens(query_text: str) -> set[str]:
