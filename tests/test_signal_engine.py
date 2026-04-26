@@ -50,3 +50,20 @@ def test_signal_engine_rejects_none_direction() -> None:
 
     assert signal_status == "REJECTED"
     assert edge == pytest.approx(0.02)
+
+
+def test_signal_engine_rejects_weak_market_match_even_with_large_edge() -> None:
+    settings = build_test_settings(risk_min_match_score=0.35)
+
+    signal_status, edge = evaluate_signal_candidate(
+        settings=settings,
+        direction="YES",
+        relevance=0.95,
+        confidence=0.95,
+        fair_probability=0.70,
+        market_price=0.10,
+        match_score=0.19,
+    )
+
+    assert signal_status == "REJECTED"
+    assert edge == pytest.approx(0.60)

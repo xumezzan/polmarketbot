@@ -90,6 +90,11 @@ def select_pending_news_for_cycle(
     return selected, stale
 
 
+def should_skip_market_pipeline_for_direction(direction: str) -> bool:
+    """Return True when a verdict can never produce a tradable signal."""
+    return direction == "NONE"
+
+
 class PipelineScheduler:
     """Simple asyncio-based scheduler for the full paper-trading pipeline."""
 
@@ -238,6 +243,29 @@ class PipelineScheduler:
                             news_item_id=news_item.id,
                         )
                         item_result.analysis_id = analysis_result.analysis_id
+
+                        if should_skip_market_pipeline_for_direction(
+                            analysis_result.verdict.direction
+                        ):
+                            item_result.market_candidate_count = 0
+                            log_event(
+                                logger,
+                                "scheduler_news_item_skipped_neutral_verdict",
+                                cycle_id=cycle_id,
+                                news_item_id=news_item.id,
+                                analysis_id=analysis_result.analysis_id,
+                                market_query=analysis_result.verdict.market_query,
+                            )
+                            self._dashboard_log(
+                                "SKIP",
+                                (
+                                    f"news #{news_item.id} analysis "
+                                    f"#{analysis_result.analysis_id} direction=NONE"
+                                ),
+                                style="yellow",
+                            )
+                            item_results.append(item_result)
+                            continue
 
                         market_result = await run_market_matching(
                             session,

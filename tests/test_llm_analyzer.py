@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from app.services.llm_analyzer import (
     LLMAuthenticationError,
+    OpenAILLMClient,
     StubLLMClient,
     build_llm_client,
 )
@@ -91,3 +92,21 @@ def test_build_llm_client_falls_back_to_stub_on_openai_auth_error(
     assert raw_response is not None
     assert raw_response["provider"] == "stub"
     assert raw_response["fallback"]["reason"] == "OpenAI authentication failed: invalid key"
+
+
+def test_openai_prompt_discourages_vague_crypto_queries() -> None:
+    client = object.__new__(OpenAILLMClient)
+    client.settings = build_test_settings(llm_max_content_chars=4000)
+    news_item = SimpleNamespace(
+        source="CoinDesk",
+        published_at=None,
+        title="AI security reshapes crypto",
+        url="https://example.com/ai-security",
+        content="Broad commentary about AI and crypto security.",
+    )
+
+    prompt = client._build_user_prompt(news_item)
+
+    assert "concrete, currently plausible binary prediction market" in prompt
+    assert "crypto security AI impact" in prompt
+    assert "Do not infer a trade only from general sentiment" in prompt

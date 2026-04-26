@@ -144,6 +144,18 @@ GENERIC_DOMAIN_TOKENS = {
     "operations",
     "approval",
     "target",
+    "market",
+    "markets",
+    "regulation",
+    "lawsuit",
+    "legal",
+    "court",
+    "policy",
+    "adoption",
+    "payment",
+    "payments",
+    "banks",
+    "polymarket",
 }
 
 
@@ -490,7 +502,13 @@ class KeywordMarketRanker:
         slug_tokens = _tokenize(market.slug or "")
         event_tokens = _tokenize(f"{market.event_title or ''} {market.event_slug or ''}")
 
-        exact_match = 1.0 if query_phrase and query_phrase in market.question.lower() else 0.0
+        exact_match = (
+            1.0
+            if len(query_tokens) >= 2
+            and query_phrase
+            and query_phrase in market.question.lower()
+            else 0.0
+        )
         question_overlap = _token_overlap(query_tokens, question_tokens)
         slug_overlap = _token_overlap(query_tokens, slug_tokens)
         event_overlap = _token_overlap(query_tokens, event_tokens)
@@ -723,8 +741,20 @@ def filter_markets_by_query_domain(
     query_text: str,
 ) -> list[GammaMarket]:
     """Reduce the candidate universe to markets in the same domain as the query."""
+    lowered = (query_text or "").strip().lower()
+    query_tokens = set(_normalized_query_tokens(lowered))
+    if _is_generic_market_legal_query(query_tokens):
+        return []
+
     anchor_tokens = extract_market_domain_anchor_tokens(query_text)
     if not anchor_tokens:
+        fallback_tokens = [
+            token
+            for token in query_tokens
+            if token not in GENERIC_DOMAIN_TOKENS
+        ]
+        if lowered and lowered != "general news" and not fallback_tokens:
+            return []
         return markets
 
     filtered = [
@@ -740,16 +770,27 @@ def extract_market_domain_anchor_tokens(query_text: str) -> set[str]:
     lowered = (query_text or "").strip().lower()
     if not lowered or lowered == "general news":
         return set()
+    query_tokens = set(_normalized_query_tokens(lowered))
 
     anchor_tokens: set[str] = set()
     asset = _detect_primary_asset(lowered)
     if asset is not None:
         anchor_tokens |= ASSET_DOMAIN_ALIASES.get(asset, {asset})
 
-    if any(token in lowered for token in ("fed", "federal reserve", "powell", "rate cut")):
+    if _contains_phrase(lowered, "federal reserve") or query_tokens & {"fed", "powell", "fomc"}:
         anchor_tokens |= MACRO_DOMAIN_TOKENS
+    elif _contains_phrase(lowered, "rate cut") or _contains_phrase(lowered, "rate cuts"):
+        anchor_tokens |= {"fed", "federal", "reserve", "rate", "rates", "fomc"}
 
-    if any(token in lowered for token in ("clarity", "crypto", "exchange", "stablecoin", "etf")):
+    if query_tokens & {"stablecoin", "stablecoins"}:
+        anchor_tokens |= {"stablecoin", "stablecoins"}
+    elif query_tokens & {"etf", "etfs"}:
+        anchor_tokens |= {"etf", "etfs", "bitcoin", "btc", "ethereum", "eth", "ether"}
+    elif query_tokens & {"clarity"}:
+        anchor_tokens |= {"clarity", "crypto", "sec", "cftc"}
+    elif query_tokens & {"cftc", "sec"}:
+        anchor_tokens |= query_tokens & {"cftc", "sec"}
+    elif query_tokens & {"crypto", "blockchain", "token", "tokens", "exchange"}:
         anchor_tokens |= CRYPTO_DOMAIN_TOKENS
 
     if anchor_tokens:
@@ -761,6 +802,18 @@ def extract_market_domain_anchor_tokens(query_text: str) -> set[str]:
         if token not in GENERIC_DOMAIN_TOKENS
     ]
     return set(fallback_tokens[:2])
+
+
+def _contains_phrase(value: str, phrase: str) -> bool:
+    return re.search(rf"\b{re.escape(phrase)}\b", value) is not None
+
+
+def _is_generic_market_legal_query(query_tokens: set[str]) -> bool:
+    return bool(
+        query_tokens & {"market", "markets"}
+        and query_tokens & {"lawsuit", "regulation", "legal", "court", "policy"}
+        and not query_tokens & {"cftc", "sec", "clarity", "crypto", "bitcoin", "ethereum", "xrp"}
+    )
 
 
 def normalize_market_query(value: str) -> str:
@@ -864,7 +917,6 @@ def _market_domain_tokens(market: GammaMarket) -> set[str]:
             market.slug or "",
             market.event_title or "",
             market.event_slug or "",
-            market.description or "",
         )
         if part
     )

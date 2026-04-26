@@ -296,6 +296,19 @@ class SignalEngine:
                 ),
             )
 
+        if candidate.match_score < self.settings.risk_min_match_score:
+            return (
+                SignalStatus.REJECTED,
+                (
+                    f"Rejected because market match is weak: "
+                    f"match_score={candidate.match_score:.4f}<"
+                    f"{self.settings.risk_min_match_score:.4f}. "
+                    f"net_edge={edge:.4f}, confidence={confidence:.4f}, "
+                    f"relevance={relevance:.4f}, market_price={market_price:.4f}, "
+                    f"execution_price={execution_price:.4f}."
+                ),
+            )
+
         if (
             edge > self.settings.signal_actionable_edge_threshold
             and confidence > self.settings.signal_actionable_confidence_threshold
@@ -350,6 +363,7 @@ def evaluate_signal_candidate(
     confidence: float,
     fair_probability: float,
     market_price: float,
+    match_score: float = 1.0,
 ) -> tuple[str, float]:
     """
     Small pure helper used for quick fake-data verification.
@@ -360,6 +374,9 @@ def evaluate_signal_candidate(
     edge = round(fair_probability - market_price, 4)
 
     if direction == VerdictDirection.NONE.value:
+        return SignalStatus.REJECTED.value, edge
+
+    if match_score < settings.risk_min_match_score:
         return SignalStatus.REJECTED.value, edge
 
     if (

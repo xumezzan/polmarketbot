@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from app.scheduler import build_skipped_ingestion_result, should_run_news_ingestion
-from app.scheduler import select_pending_news_for_cycle
+from app.scheduler import select_pending_news_for_cycle, should_skip_market_pipeline_for_direction
 from tests.helpers import build_test_settings
 
 
@@ -85,3 +85,9 @@ def test_select_pending_news_for_cycle_keeps_unknown_timestamps() -> None:
 
     assert [item.id for item in selected] == [1, 2]
     assert stale == []
+
+
+def test_scheduler_skips_market_pipeline_for_neutral_verdicts() -> None:
+    assert should_skip_market_pipeline_for_direction("NONE") is True
+    assert should_skip_market_pipeline_for_direction("YES") is False
+    assert should_skip_market_pipeline_for_direction("NO") is False
