@@ -120,9 +120,10 @@ class TelegramBotService:
             "inline_keyboard": [
                 [
                     {"text": "📊 Статус", "callback_data": "status"},
-                    {"text": "📈 Сделки", "callback_data": "trades"},
+                    {"text": "📰 Новости", "callback_data": "news"},
                 ],
                 [
+                    {"text": "📈 Сделки", "callback_data": "trades"},
                     {"text": "📉 PnL", "callback_data": "pnl"},
                 ],
                 [

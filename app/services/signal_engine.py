@@ -311,8 +311,8 @@ class SignalEngine:
 
         if (
             edge > self.settings.signal_actionable_edge_threshold
-            and confidence > self.settings.signal_actionable_confidence_threshold
-            and relevance > self.settings.signal_actionable_relevance_threshold
+            and confidence >= self.settings.signal_actionable_confidence_threshold
+            and relevance >= self.settings.signal_actionable_relevance_threshold
         ):
             return (
                 SignalStatus.ACTIONABLE,
@@ -381,8 +381,8 @@ def evaluate_signal_candidate(
 
     if (
         edge > settings.signal_actionable_edge_threshold
-        and confidence > settings.signal_actionable_confidence_threshold
-        and relevance > settings.signal_actionable_relevance_threshold
+        and confidence >= settings.signal_actionable_confidence_threshold
+        and relevance >= settings.signal_actionable_relevance_threshold
     ):
         return SignalStatus.ACTIONABLE.value, edge
 

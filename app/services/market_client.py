@@ -177,6 +177,26 @@ RELATIVE_PERFORMANCE_TOKENS = {
     "perform",
 }
 
+ASSET_PURCHASE_TOKENS = {
+    "add",
+    "adds",
+    "acquire",
+    "acquires",
+    "buy",
+    "buys",
+    "bought",
+    "purchase",
+    "purchases",
+}
+
+ASSET_SALE_TOKENS = {
+    "sell",
+    "sells",
+    "sold",
+    "sale",
+    "sales",
+}
+
 
 class MarketClientError(Exception):
     """Raised when market fetching or matching fails."""
@@ -839,6 +859,10 @@ def infer_market_contract_type(value: str) -> str:
         and tokens & {"cut", "cuts", "rate", "rates"}
     ):
         return "rate_cut"
+    if tokens & ASSET_SALE_TOKENS:
+        return "asset_sale"
+    if tokens & ASSET_PURCHASE_TOKENS:
+        return "asset_purchase"
 
     return "generic"
 
@@ -918,6 +942,24 @@ def normalize_market_query(value: str) -> str:
 
     if asset and "quantum" in lowered:
         return f"{asset} quantum"
+
+    if asset == "bitcoin" and (
+        "microstrategy" in lowered
+        or "mstr" in lowered
+        or (
+            re.search(r"\bstrategy\b", lowered) is not None
+            and re.search(r"\b(saylor|hold|holds|holding|holdings|buy|buys|bought|purchase|purchases)\b", lowered)
+            is not None
+        )
+    ):
+        if re.search(r"\b(sell|sells|sold|sale|sales)\b", lowered) is not None:
+            return "microstrategy bitcoin sell"
+        if (
+            re.search(r"\b(add|adds|acquire|acquires|buy|buys|bought|purchase|purchases)\b", lowered)
+            is not None
+        ):
+            return "microstrategy bitcoin buy"
+        return "microstrategy bitcoin holdings"
 
     if asset and ("transaction volume" in lowered or "volume" in lowered):
         return f"{asset} volume"

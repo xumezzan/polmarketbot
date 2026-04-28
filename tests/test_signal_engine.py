@@ -20,6 +20,23 @@ def test_signal_engine_returns_actionable_for_strong_signal() -> None:
     assert edge == pytest.approx(0.10)
 
 
+def test_signal_engine_accepts_confidence_at_threshold() -> None:
+    settings = build_test_settings(signal_actionable_confidence_threshold=0.60)
+
+    signal_status, edge = evaluate_signal_candidate(
+        settings=settings,
+        direction="YES",
+        relevance=0.70,
+        confidence=0.60,
+        fair_probability=0.70,
+        market_price=0.55,
+        match_score=0.90,
+    )
+
+    assert signal_status == "ACTIONABLE"
+    assert edge == pytest.approx(0.15)
+
+
 def test_signal_engine_returns_watchlist_for_positive_but_weak_edge() -> None:
     settings = build_test_settings()
 

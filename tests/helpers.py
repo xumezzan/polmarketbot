@@ -10,6 +10,7 @@ def build_test_settings(**overrides: object) -> Settings:
         "market_fetch_mode": "stub",
         "alert_mode": "noop",
         "postgres_host": "127.0.0.1",
+        "risk_enable_extended_news_age_window": False,
     }
     base.update(overrides)
     return Settings(**base)

@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     market_correlation_jaccard_threshold: float = 0.75
     market_correlation_block_same_event: bool = True
     signal_actionable_edge_threshold: float = 0.07
-    signal_actionable_confidence_threshold: float = 0.70
+    signal_actionable_confidence_threshold: float = 0.60
     signal_actionable_relevance_threshold: float = 0.65
     signal_watchlist_edge_threshold: float = 0.01
     signal_calibration_enabled: bool = True
@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     signal_market_consensus_max_weight: float = 0.35
     signal_liquidity_penalty_factor: float = 0.20
     signal_liquidity_penalty_cap: float = 0.03
-    risk_min_confidence: float = 0.70
+    risk_min_confidence: float = 0.60
     risk_min_relevance: float = 0.65
     risk_max_news_age_minutes: int = 360
     risk_enable_extended_news_age_window: bool = False

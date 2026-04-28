@@ -89,6 +89,15 @@ class NewsRepository:
         stmt = sa.select(NewsItem).order_by(NewsItem.id.desc()).limit(1)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def list_recent_news(self, *, limit: int = 5) -> list[NewsItem]:
+        """Return recent stored news ordered by publication time."""
+        stmt = (
+            sa.select(NewsItem)
+            .order_by(NewsItem.published_at.desc().nullslast(), NewsItem.id.desc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def list_without_analysis(self, *, limit: int | None = None) -> list[NewsItem]:
         """Return news items that have not gone through LLM analysis yet."""
         analysis_exists = (

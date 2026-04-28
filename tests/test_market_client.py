@@ -30,6 +30,13 @@ def test_normalize_market_query_maps_operational_queries_to_tradeable_terms() ->
     assert normalize_market_query("Bitcoin quantum resistance upgrades") == "bitcoin quantum"
 
 
+def test_normalize_market_query_maps_strategy_to_microstrategy() -> None:
+    assert (
+        normalize_market_query("Strategy buys 3,273 bitcoin as it nears 1 million target")
+        == "microstrategy bitcoin buy"
+    )
+
+
 def test_normalize_market_query_keeps_non_bitcoin_assets_compact() -> None:
     assert normalize_market_query("Ethereum transaction volume increase") == "ethereum volume"
     assert normalize_market_query("XRP price prediction") == "xrp"
@@ -226,6 +233,24 @@ def test_market_contract_compatibility_rejects_wrong_bitcoin_contract_type() -> 
     assert (
         market_contract_compatibility(
             query_text="bitcoin 100k december 2026",
+            market=market,
+        )
+        == 0.0
+    )
+
+
+def test_market_contract_compatibility_rejects_purchase_query_for_sale_market() -> None:
+    market = GammaMarket.model_validate(
+        {
+            "id": "mstr-sell",
+            "question": "MicroStrategy sells any Bitcoin by June 30, 2026?",
+            "slug": "microstrategy-sells-any-bitcoin-by-june-30-2026",
+        }
+    )
+
+    assert (
+        market_contract_compatibility(
+            query_text="microstrategy bitcoin buy",
             market=market,
         )
         == 0.0

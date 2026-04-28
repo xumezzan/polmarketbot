@@ -1,5 +1,5 @@
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 from fastapi import Depends, FastAPI, Query
@@ -425,6 +425,11 @@ async def _handle_telegram_callback(
             chat_id=chat_id,
             text=_format_status_message(status),
         )
+    elif data == "news":
+        await bot_service.send_message(
+            chat_id=chat_id,
+            text=await _format_recent_news_message(session=session),
+        )
     elif data == "trades":
         await bot_service.send_message(
             chat_id=chat_id,
@@ -467,8 +472,8 @@ def _format_status_message(status: AdminStatusResponse) -> str:
                 status.last_scheduler_cycle_finished_at.replace("Z", "+00:00")
             )
             if finished_at.tzinfo is None:
-                finished_at = finished_at.replace(tzinfo=UTC)
-            now = datetime.now(UTC)
+                finished_at = finished_at.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
             max_stale = max(settings.scheduler_interval_minutes * 3, 15.0)
             pipeline_alive = (now - finished_at) <= timedelta(minutes=max_stale)
         except ValueError:
@@ -497,6 +502,31 @@ def _format_status_message(status: AdminStatusResponse) -> str:
     ]
     lines.extend(cooldown_lines)
     return "\n".join(lines)
+
+
+async def _format_recent_news_message(*, session: AsyncSession) -> str:
+    """Build Telegram text for the latest stored news."""
+    news_items = await NewsRepository(session).list_recent_news(limit=5)
+    if not news_items:
+        return "<b>📰 Последние новости</b>\nНовостей пока нет."
+
+    lines = ["<b>📰 Последние 5 новостей</b>"]
+    for item in news_items:
+        published_at = item.published_at.isoformat() if item.published_at else "n/a"
+        title = escape(item.title)
+        source = escape(item.source)
+        url = escape(item.url, quote=True)
+        lines.append(
+            "\n".join(
+                [
+                    f"<b>{title}</b>",
+                    f"Источник: <code>{source}</code>",
+                    f"Дата: <code>{escape(published_at)}</code>",
+                    f"<a href=\"{url}\">Открыть новость</a>",
+                ]
+            )
+        )
+    return "\n\n".join(lines)
 
 
 async def _format_recent_trades_message(*, session: AsyncSession) -> str:
