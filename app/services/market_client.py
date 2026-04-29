@@ -1,10 +1,12 @@
 import argparse
 import asyncio
+import json
 import logging
 import math
 import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol
 
 import httpx
@@ -44,6 +46,8 @@ QUERY_FILLER_TOKENS = {
     "approval",
     "approve",
     "approved",
+    "action",
+    "actions",
     "called",
     "every",
     "exchange",
@@ -365,6 +369,25 @@ class GammaPolymarketClient:
         self.settings = settings
 
     async def fetch_markets(self) -> list[GammaMarket]:
+        try:
+            markets = await self._fetch_markets_live()
+        except MarketClientError:
+            cached_markets = self._load_cached_markets()
+            if cached_markets:
+                log_event(
+                    logger,
+                    "gamma_market_fetch_using_cache",
+                    provider="polymarket_gamma",
+                    fetched_count=len(cached_markets),
+                    cache_path=self.settings.gamma_market_cache_path,
+                )
+                return cached_markets
+            raise
+
+        self._save_cached_markets(markets)
+        return markets
+
+    async def _fetch_markets_live(self) -> list[GammaMarket]:
         markets: list[GammaMarket] = []
         base_url = f"{self.settings.gamma_api_base_url.rstrip('/')}/markets"
 
@@ -427,6 +450,77 @@ class GammaPolymarketClient:
         )
         return markets
 
+    def _save_cached_markets(self, markets: list[GammaMarket]) -> None:
+        if not self.settings.gamma_market_cache_enabled or not markets:
+            return
+
+        cache_path = Path(self.settings.gamma_market_cache_path)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "markets": [
+                    market.raw_payload
+                    if market.raw_payload
+                    else market.model_dump(mode="json", by_alias=True)
+                    for market in markets
+                ],
+            }
+            cache_path.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError as exc:
+            log_event(
+                logger,
+                "gamma_market_cache_write_failed",
+                provider="polymarket_gamma",
+                cache_path=str(cache_path),
+                error=str(exc),
+            )
+
+    def _load_cached_markets(self) -> list[GammaMarket]:
+        if not self.settings.gamma_market_cache_enabled:
+            return []
+
+        cache_path = Path(self.settings.gamma_market_cache_path)
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log_event(
+                logger,
+                "gamma_market_cache_read_failed",
+                provider="polymarket_gamma",
+                cache_path=str(cache_path),
+                error=str(exc),
+            )
+            return []
+
+        generated_at = _parse_cache_datetime(payload.get("generated_at"))
+        if generated_at is None:
+            return []
+
+        age_minutes = (datetime.now(UTC) - generated_at).total_seconds() / 60
+        if age_minutes > self.settings.gamma_market_cache_max_age_minutes:
+            log_event(
+                logger,
+                "gamma_market_cache_stale",
+                provider="polymarket_gamma",
+                cache_path=str(cache_path),
+                age_minutes=round(age_minutes, 2),
+                max_age_minutes=self.settings.gamma_market_cache_max_age_minutes,
+            )
+            return []
+
+        raw_markets = payload.get("markets")
+        if not isinstance(raw_markets, list):
+            return []
+
+        markets: list[GammaMarket] = []
+        for item in raw_markets:
+            if not isinstance(item, dict):
+                continue
+            market = self._normalize_market(item)
+            markets.append(market)
+        return markets
+
     async def fetch_market(self, market_id: str) -> GammaMarket | None:
         base_url = f"{self.settings.gamma_api_base_url.rstrip('/')}/markets/{market_id}"
 
@@ -487,6 +581,18 @@ def _is_retryable_gamma_exception(exc: Exception) -> bool:
     return isinstance(exc, httpx.TransportError)
 
 
+def _parse_cache_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 class MarketRankerProtocol(Protocol):
     """Contract for ranking candidate markets."""
 
@@ -517,6 +623,9 @@ class KeywordMarketRanker:
 
         ranked: list[MarketCandidate] = []
         for market in markets:
+            if not is_market_domain_compatible(query_text=query_phrase, market=market):
+                continue
+
             contract_compatibility = market_contract_compatibility(
                 query_text=query_phrase,
                 market=market,
@@ -812,8 +921,122 @@ def filter_markets_by_query_domain(
         market
         for market in markets
         if _market_domain_tokens(market) & anchor_tokens
+        and is_market_domain_compatible(query_text=lowered, market=market)
     ]
     return filtered
+
+
+def is_market_domain_compatible(*, query_text: str, market: GammaMarket) -> bool:
+    """Return False for high-confidence false friends between news queries and markets."""
+    query = (query_text or "").lower()
+    query_tokens = set(_normalized_query_tokens(query))
+    market_text = _market_text(market)
+    market_tokens = _tokenize(market_text)
+
+    if not query_tokens:
+        return True
+
+    if {"data", "breach"} <= query_tokens or query_tokens & {"breach", "hack", "hacked"}:
+        if _contains_phrase(market_text, "data center") and not _contains_phrase(query, "data center"):
+            return False
+        if market_tokens & {
+            "baseball",
+            "basketball",
+            "boston",
+            "cdl",
+            "championship",
+            "esports",
+            "football",
+            "game",
+            "hockey",
+            "league",
+            "season",
+            "soccer",
+            "team",
+        }:
+            return False
+        return bool(
+            market_tokens
+            & {
+                "breach",
+                "breaches",
+                "cyber",
+                "cyberattack",
+                "cybersecurity",
+                "data",
+                "hack",
+                "hacked",
+                "hacker",
+                "leak",
+                "leaked",
+                "privacy",
+                "polymarket",
+            }
+        )
+
+    if query_tokens & {"atm", "atms", "kiosk", "kiosks"}:
+        return bool(market_tokens & {"atm", "atms", "kiosk", "kiosks"})
+
+    if "clarity" in query_tokens:
+        return bool(
+            "clarity" in market_tokens
+            or (
+                "act" in market_tokens
+                and market_tokens & {"crypto", "cryptocurrency", "senate", "stablecoin"}
+            )
+        )
+
+    if "ipo" in query_tokens:
+        ipo_subjects = query_tokens & {
+            "openai",
+            "spacex",
+            "stripe",
+            "anthropic",
+            "xai",
+            "databricks",
+        }
+        if ipo_subjects and not ipo_subjects <= market_tokens:
+            return False
+        return "ipo" in market_tokens
+
+    geography_tokens = query_tokens & {
+        "argentina",
+        "brazil",
+        "canada",
+        "canadian",
+        "china",
+        "europe",
+        "eu",
+        "france",
+        "germany",
+        "india",
+        "iran",
+        "israel",
+        "japan",
+        "mexico",
+        "russia",
+        "taiwan",
+        "ukraine",
+        "us",
+        "usa",
+    }
+    if geography_tokens and query_tokens & {
+        "ban",
+        "bans",
+        "bill",
+        "court",
+        "law",
+        "lawsuit",
+        "policy",
+        "regulation",
+        "sanction",
+        "sanctions",
+        "tariff",
+        "tariffs",
+    }:
+        return bool(geography_tokens & market_tokens)
+
+    return True
 
 
 def market_contract_compatibility(*, query_text: str, market: GammaMarket) -> float:
@@ -924,7 +1147,7 @@ def normalize_market_query(value: str) -> str:
     if not raw:
         return raw
 
-    lowered = raw.lower()
+    lowered = _normalize_query_typos(raw.lower())
     asset = _detect_primary_asset(lowered)
     price_target = _extract_price_target(lowered)
 
@@ -1029,8 +1252,24 @@ def _normalized_query_tokens(value: str) -> list[str]:
     return tokens
 
 
+def _normalize_query_typos(value: str) -> str:
+    replacements = {
+        "claritiy": "clarity",
+        "clarty": "clarity",
+        "clariy": "clarity",
+    }
+    normalized = value
+    for typo, replacement in replacements.items():
+        normalized = re.sub(rf"\b{typo}\b", replacement, normalized)
+    return normalized
+
+
 def _market_domain_tokens(market: GammaMarket) -> set[str]:
-    text = " ".join(
+    return _tokenize(_market_text(market))
+
+
+def _market_text(market: GammaMarket) -> str:
+    return " ".join(
         part
         for part in (
             market.question,
@@ -1039,8 +1278,7 @@ def _market_domain_tokens(market: GammaMarket) -> set[str]:
             market.event_slug or "",
         )
         if part
-    )
-    return _tokenize(text)
+    ).lower()
 
 
 def _token_overlap(query_tokens: set[str], document_tokens: set[str]) -> float:

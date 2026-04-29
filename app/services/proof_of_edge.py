@@ -111,10 +111,10 @@ class ProofOfEdgeService:
         self,
         *,
         settings,
-        window_days: int = 7,
-        required_min_days: int = 3,
-        required_max_days: int = 7,
-        required_min_closed_trades: int = 10,
+        window_days: int = 30,
+        required_min_days: int = 14,
+        required_max_days: int = 30,
+        required_min_closed_trades: int = 30,
     ) -> PaperTradePhaseGateReport:
         now = datetime.now(UTC)
         since = now - timedelta(days=window_days)

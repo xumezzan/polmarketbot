@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -87,6 +88,67 @@ _FED_HINTS = (
     "interest rates",
 )
 
+TRADABLE_EVENT_HINTS = {
+    "approval",
+    "approves",
+    "approved",
+    "ban",
+    "bans",
+    "bill",
+    "ceasefire",
+    "court",
+    "cut",
+    "cuts",
+    "data breach",
+    "etf",
+    "filing",
+    "hack",
+    "hacked",
+    "ipo",
+    "lawsuit",
+    "launch",
+    "rate cut",
+    "regulation",
+    "resign",
+    "resigns",
+    "ruling",
+    "sanction",
+    "sanctions",
+    "senate",
+    "tariff",
+    "tariffs",
+}
+
+SPECIFIC_MARKET_HINTS = {
+    "act",
+    "atm",
+    "atms",
+    "bitcoin",
+    "btc",
+    "canada",
+    "clarity",
+    "crypto",
+    "ethereum",
+    "fed",
+    "fomc",
+    "ipo",
+    "openai",
+    "polymarket",
+    "powell",
+    "sec",
+    "senate",
+    "trump",
+    "xrp",
+}
+
+GENERIC_MARKET_QUERIES = {
+    "general news",
+    "crypto news",
+    "crypto impact",
+    "market impact",
+    "prediction market",
+}
+
 
 class LLMAnalysisError(Exception):
     """Raised when the LLM analysis step fails."""
@@ -116,6 +178,25 @@ class StubLLMClient:
         has_etf = "etf" in text
         has_fed = _contains_any(text, _FED_HINTS) or "fed" in text
         references_bitcoin_market = has_bitcoin or has_etf or has_crypto
+        has_hype_catalyst = _contains_any(
+            text,
+            (
+                "approval",
+                "approves",
+                "breakout",
+                "files",
+                "filing",
+                "inflow",
+                "inflows",
+                "launch",
+                "milestone",
+                "record",
+                "rumor",
+                "surge",
+                "surges",
+                "whale",
+            ),
+        )
 
         if references_bitcoin_market and any(
             token in text for token in ("$1m", "1m", "one million", "gta vi")
@@ -131,16 +212,18 @@ class StubLLMClient:
                     "the stub maps it to a specific long-dated bitcoin milestone market."
                 ),
             )
-        elif references_bitcoin_market and _contains_any(text, _BTC_POSITIVE_HINTS):
+        elif references_bitcoin_market and (
+            _contains_any(text, _BTC_POSITIVE_HINTS) or has_hype_catalyst
+        ):
             verdict = Verdict(
-                relevance=0.87,
-                confidence=0.80,
+                relevance=0.90,
+                confidence=0.84,
                 direction="YES",
-                fair_probability=0.67,
+                fair_probability=0.69,
                 market_query="bitcoin 150k june 2026",
                 reason=(
-                    "The article looks like a bullish bitcoin catalyst, so the stub maps "
-                    "it to a concrete upside target instead of a vague bitcoin price query."
+                    "The article looks like a bullish high-attention bitcoin catalyst, so "
+                    "the stub maps it to a concrete upside target instead of a vague query."
                 ),
             )
         elif references_bitcoin_market and _contains_any(text, _BTC_AMBIGUOUS_HINTS):
@@ -217,6 +300,114 @@ def _contains_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(pattern in text for pattern in patterns)
 
 
+def score_verdict_market_readiness(
+    *,
+    verdict: Verdict,
+    title: str | None,
+    content: str | None,
+) -> dict[str, object]:
+    """Score whether a verdict is likely to map to a concrete Polymarket search."""
+    query = (verdict.market_query or "").strip().lower()
+    title_text = (title or "").lower()
+    content_text = (content or "").lower()
+    combined_text = f"{query}\n{title_text}\n{content_text}"
+    query_tokens = _score_tokens(query)
+    combined_tokens = _score_tokens(combined_text)
+    reasons: list[str] = []
+
+    tradability = 0.0
+    if verdict.direction in {"YES", "NO"}:
+        tradability += 0.25
+        reasons.append("directional_verdict")
+    if verdict.confidence >= 0.55:
+        tradability += 0.15
+        reasons.append("confidence_above_gate")
+    if verdict.relevance >= 0.55:
+        tradability += 0.15
+        reasons.append("relevance_above_gate")
+    event_hits = {
+        hint for hint in TRADABLE_EVENT_HINTS if _score_contains_phrase(combined_text, hint)
+    }
+    if event_hits:
+        tradability += min(0.30, 0.10 * len(event_hits))
+        reasons.append("event_hints=" + ",".join(sorted(event_hits)[:5]))
+    if re.search(r"\b20\d{2}\b", combined_text):
+        tradability += 0.10
+        reasons.append("timeframe_present")
+    if re.search(r"\b\d+(?:k|m|%)?\b", combined_text):
+        tradability += 0.05
+        reasons.append("measurable_number_present")
+
+    specificity = 0.0
+    if query and query not in GENERIC_MARKET_QUERIES:
+        specificity += 0.20
+        reasons.append("non_generic_query")
+    if len(query_tokens) >= 3:
+        specificity += 0.20
+        reasons.append("query_has_3plus_tokens")
+    elif len(query_tokens) >= 2:
+        specificity += 0.10
+        reasons.append("query_has_2plus_tokens")
+    specific_hits = query_tokens & SPECIFIC_MARKET_HINTS
+    if specific_hits:
+        specificity += min(0.30, 0.10 * len(specific_hits))
+        reasons.append("specific_query_terms=" + ",".join(sorted(specific_hits)[:5]))
+    if re.search(r"\b20\d{2}\b", query):
+        specificity += 0.15
+        reasons.append("query_timeframe_present")
+    if combined_tokens & {"canada", "china", "fed", "openai", "polymarket", "trump"}:
+        specificity += 0.10
+        reasons.append("named_entity_present")
+
+    if query in GENERIC_MARKET_QUERIES:
+        specificity = min(specificity, 0.15)
+        tradability = min(tradability, 0.25)
+        reasons.append("generic_market_query_penalty")
+
+    return {
+        "tradability_score": round(min(tradability, 1.0), 4),
+        "market_specificity_score": round(min(specificity, 1.0), 4),
+        "reasons": reasons,
+    }
+
+
+def resolve_market_pipeline_skip_reason(
+    *,
+    settings: Settings,
+    verdict: Verdict,
+    scores: dict[str, object] | None,
+) -> str | None:
+    if verdict.direction == "NONE":
+        return "neutral_verdict"
+
+    if not scores:
+        return None
+
+    tradability_score = float(scores.get("tradability_score") or 0.0)
+    specificity_score = float(scores.get("market_specificity_score") or 0.0)
+    if tradability_score < settings.llm_min_tradability_score_for_market_pipeline:
+        return (
+            "tradability_score_below_threshold:"
+            f"{tradability_score:.4f}<"
+            f"{settings.llm_min_tradability_score_for_market_pipeline:.4f}"
+        )
+    if specificity_score < settings.llm_min_market_specificity_score_for_market_pipeline:
+        return (
+            "market_specificity_score_below_threshold:"
+            f"{specificity_score:.4f}<"
+            f"{settings.llm_min_market_specificity_score_for_market_pipeline:.4f}"
+        )
+    return None
+
+
+def _score_tokens(value: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _score_contains_phrase(value: str, phrase: str) -> bool:
+    return re.search(rf"\b{re.escape(phrase)}\b", value) is not None
+
+
 class OpenAILLMClient:
     """
     OpenAI adapter for structured verdict generation.
@@ -255,7 +446,8 @@ class OpenAILLMClient:
                             "You analyze news for a Polymarket paper-trading bot. "
                             "Return only a structured verdict that follows the schema. "
                             "LLM is an advisor, not the final decision-maker. "
-                            "Be conservative. If the article is weak or ambiguous, use "
+                            "Use an aggressive catalyst-seeking style, but do not invent facts. "
+                            "If the article is weak or ambiguous, use "
                             "direction=NONE and fair_probability near 0.50."
                         ),
                     },
@@ -323,16 +515,22 @@ class OpenAILLMClient:
 
         return (
             "Analyze the following news item for a Polymarket news trading bot.\n\n"
-            "Only produce a directional YES/NO verdict when the news maps to a concrete, "
-            "currently plausible binary prediction market. Prefer specific market_query "
+            "Prefer a directional YES/NO verdict when the news is fresh, high-attention, "
+            "and maps to a concrete, currently plausible binary prediction market. "
+            "Treat approvals, filings, bans, court rulings, exchange/product launches, "
+            "ETF flows, hacks, sanctions, tariffs, resignations, ceasefire headlines, "
+            "major company/person actions, and sharp crypto/macro catalysts as tradable "
+            "signals when they have a clear market side. Prefer specific market_query "
             "phrases that include the entity, measurable outcome, and timeframe when known "
             "(for example: 'bitcoin 150k june 2026', 'fed rate cuts 2026', "
             "'trump crypto tax 2027').\n\n"
             "Use direction=NONE, fair_probability=0.50, and a low confidence when the article "
             "is broad industry commentary, conference/speaker news, product thought leadership, "
-            "security speculation, vague AI/crypto impact, or price movement without a clear "
-            "market catalyst. For direction=NONE, market_query should be either a concrete "
-            "market to monitor or 'general news'; do not use vague queries like "
+            "vague AI/crypto impact, or price movement without a clear market catalyst. "
+            "Do not suppress a verdict merely because evidence is early; encode uncertainty "
+            "in confidence and fair_probability while still choosing YES/NO when there is "
+            "a concrete market and directional catalyst. For direction=NONE, market_query "
+            "should be either a concrete market to monitor or 'general news'; do not use vague queries like "
             "'crypto impact', 'AI agents in crypto payments', or 'crypto security AI impact'.\n\n"
             "Do not infer a trade only from general sentiment. A good verdict should answer: "
             "which binary market would this affect, which side, and why now?\n\n"
@@ -516,6 +714,12 @@ class LLMAnalyzerService:
         existing = await self.analysis_repository.get_by_news_item_id(news_item.id)
         if existing is not None and not force:
             verdict = self._analysis_to_verdict(existing)
+            scores = self._extract_market_readiness_scores(existing.raw_response)
+            skip_reason = resolve_market_pipeline_skip_reason(
+                settings=getattr(self.client, "settings", get_settings()),
+                verdict=verdict,
+                scores=scores,
+            )
             log_event(
                 logger,
                 "llm_analysis_reused",
@@ -527,10 +731,35 @@ class LLMAnalyzerService:
                 analysis_id=existing.id,
                 created_new=False,
                 verdict=verdict,
+                tradability_score=(
+                    float(scores["tradability_score"])
+                    if scores and scores.get("tradability_score") is not None
+                    else None
+                ),
+                market_specificity_score=(
+                    float(scores["market_specificity_score"])
+                    if scores and scores.get("market_specificity_score") is not None
+                    else None
+                ),
+                market_pipeline_skip_reason=skip_reason,
             )
 
         await self._enforce_daily_budget()
         verdict, raw_response = await self.client.analyze_news_item(news_item)
+        settings = getattr(self.client, "settings", get_settings())
+        scores = score_verdict_market_readiness(
+            verdict=verdict,
+            title=news_item.title,
+            content=news_item.content,
+        )
+        raw_payload = dict(raw_response or {})
+        raw_payload["market_readiness"] = scores
+        raw_response = raw_payload
+        skip_reason = resolve_market_pipeline_skip_reason(
+            settings=settings,
+            verdict=verdict,
+            scores=scores,
+        )
         usage = self._extract_usage(raw_response)
         analysis = await self.analysis_repository.create(
             news_item_id=news_item.id,
@@ -553,12 +782,18 @@ class LLMAnalyzerService:
             relevance=verdict.relevance,
             confidence=verdict.confidence,
             fair_probability=verdict.fair_probability,
+            tradability_score=scores["tradability_score"],
+            market_specificity_score=scores["market_specificity_score"],
+            market_pipeline_skip_reason=skip_reason,
         )
         return AnalysisRunResult(
             news_item_id=news_item.id,
             analysis_id=analysis.id,
             created_new=True,
             verdict=verdict,
+            tradability_score=float(scores["tradability_score"]),
+            market_specificity_score=float(scores["market_specificity_score"]),
+            market_pipeline_skip_reason=skip_reason,
         )
 
     async def _enforce_daily_budget(self) -> None:
@@ -622,6 +857,13 @@ class LLMAnalyzerService:
     ) -> str | None:
         value = (raw_response or {}).get(field_name)
         return str(value) if value is not None else None
+
+    def _extract_market_readiness_scores(
+        self,
+        raw_response: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        scores = (raw_response or {}).get("market_readiness")
+        return scores if isinstance(scores, dict) else None
 
 
 async def run_llm_analysis(

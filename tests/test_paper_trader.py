@@ -1,11 +1,38 @@
+import asyncio
 from collections import Counter
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+from app.models.enums import MarketSide
 from app.services.paper_trader import (
+    PaperTrader,
     build_paper_trade_analytics,
+    calculate_current_edge,
     evaluate_auto_close_case,
+    evaluate_opposite_news_exit_case,
     select_exit_market_price,
 )
 from tests.helpers import build_test_settings
+
+
+class FakeReportTradeRepository:
+    def __init__(self, positions, trades):
+        self.positions = positions
+        self.trades = trades
+
+    async def list_open_positions(self):
+        return self.positions
+
+    async def get_open_trade_for_position(self, *, position_id: int):
+        return self.trades.get(position_id)
+
+
+class FakeReportMarketClient:
+    def __init__(self, markets):
+        self.markets = markets
+
+    async def fetch_market(self, market_id: str):
+        return self.markets.get(market_id)
 
 
 def test_auto_close_triggers_take_profit() -> None:
@@ -65,6 +92,81 @@ def test_auto_close_triggers_max_hold_time() -> None:
     assert delta == 0.02
 
 
+def test_auto_close_triggers_when_edge_evaporates_after_grace_period() -> None:
+    settings = build_test_settings(
+        paper_take_profit_delta=0.20,
+        paper_stop_loss_delta=0.20,
+        paper_max_hold_minutes=360,
+        paper_edge_exit_enabled=True,
+        paper_min_current_edge=0.0,
+        paper_max_edge_deterioration=0.12,
+        paper_edge_exit_grace_minutes=30,
+    )
+
+    should_close, close_reason, delta = evaluate_auto_close_case(
+        settings=settings,
+        entry_price=0.44,
+        current_price=0.58,
+        holding_minutes=45,
+        entry_edge=0.22,
+        current_edge=-0.01,
+    )
+
+    assert should_close is True
+    assert close_reason == "edge_evaporated:-0.0100<=0.0000"
+    assert delta == 0.14
+
+
+def test_auto_close_triggers_when_edge_deteriorates_after_grace_period() -> None:
+    settings = build_test_settings(
+        paper_take_profit_delta=0.20,
+        paper_stop_loss_delta=0.20,
+        paper_max_hold_minutes=360,
+        paper_edge_exit_enabled=True,
+        paper_min_current_edge=0.0,
+        paper_max_edge_deterioration=0.12,
+        paper_edge_exit_grace_minutes=30,
+    )
+
+    should_close, close_reason, delta = evaluate_auto_close_case(
+        settings=settings,
+        entry_price=0.44,
+        current_price=0.50,
+        holding_minutes=45,
+        entry_edge=0.22,
+        current_edge=0.08,
+    )
+
+    assert should_close is True
+    assert close_reason == "edge_deteriorated:-0.1400<=-0.1200"
+    assert delta == 0.06
+
+
+def test_auto_close_does_not_use_edge_exit_during_grace_period() -> None:
+    settings = build_test_settings(
+        paper_take_profit_delta=0.20,
+        paper_stop_loss_delta=0.20,
+        paper_max_hold_minutes=360,
+        paper_edge_exit_enabled=True,
+        paper_min_current_edge=0.0,
+        paper_max_edge_deterioration=0.12,
+        paper_edge_exit_grace_minutes=30,
+    )
+
+    should_close, close_reason, delta = evaluate_auto_close_case(
+        settings=settings,
+        entry_price=0.44,
+        current_price=0.50,
+        holding_minutes=10,
+        entry_edge=0.22,
+        current_edge=-0.01,
+    )
+
+    assert should_close is False
+    assert close_reason is None
+    assert delta == 0.06
+
+
 def test_auto_close_holds_when_exit_rules_not_met() -> None:
     settings = build_test_settings(
         paper_take_profit_delta=0.08,
@@ -82,6 +184,151 @@ def test_auto_close_holds_when_exit_rules_not_met() -> None:
     assert should_close is False
     assert close_reason is None
     assert delta == 0.03
+
+
+def test_calculate_current_edge_uses_side_aligned_probability_and_price() -> None:
+    assert calculate_current_edge(fair_probability=0.66, current_price=0.44) == 0.22
+    assert calculate_current_edge(fair_probability=None, current_price=0.44) is None
+
+
+def test_inspect_open_positions_reports_edge_exit_without_closing() -> None:
+    opened_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+    analysis = SimpleNamespace(
+        id=101,
+        news_item_id=201,
+        market_query="bitcoin etf approval",
+        news_item=SimpleNamespace(title="ETF approval odds rise", source="coindesk"),
+    )
+    signal = SimpleNamespace(
+        id=11,
+        analysis=analysis,
+        fair_probability=0.66,
+        edge=0.22,
+    )
+    position = SimpleNamespace(
+        id=7,
+        signal_id=11,
+        signal=signal,
+        market_id="btc-etf",
+        market_question="Will a Bitcoin ETF be approved?",
+        side=MarketSide.YES,
+        entry_price=0.44,
+        size_usd=50.0,
+        shares=113.636363,
+        opened_at=opened_at,
+    )
+    trade = SimpleNamespace(id=17, entry_price=0.44, opened_at=opened_at)
+    market = SimpleNamespace(
+        yes_price=0.58,
+        no_price=0.42,
+        last_trade_price=0.58,
+        liquidity=10000.0,
+        best_bid=0.57,
+        best_ask=0.59,
+        closed=False,
+        active=True,
+        end_date=None,
+        resolution_source=None,
+    )
+    trader = PaperTrader(
+        settings=build_test_settings(
+            paper_take_profit_delta=0.20,
+            paper_stop_loss_delta=0.20,
+            paper_edge_exit_enabled=True,
+            paper_max_edge_deterioration=0.12,
+            paper_edge_exit_grace_minutes=30,
+            paper_opposite_news_exit_enabled=False,
+        ),
+        signal_repository=SimpleNamespace(),
+        analysis_repository=SimpleNamespace(),
+        trade_repository=FakeReportTradeRepository({position.id: position}.values(), {7: trade}),
+        forecast_observation_repository=SimpleNamespace(),
+        runtime_flag_repository=SimpleNamespace(),
+        market_client=FakeReportMarketClient({"btc-etf": market}),
+    )
+
+    report = asyncio.run(trader.inspect_open_positions())
+
+    assert report.count == 1
+    assert report.would_close_count == 1
+    assert report.held_count == 0
+    assert report.skipped_count == 0
+    item = report.items[0]
+    assert item.action == "WOULD_CLOSE"
+    assert item.close_reason == "edge_deteriorated:-0.1400<=-0.1200"
+    assert item.current_price == 0.58
+    assert item.current_edge == 0.08
+    assert item.edge_delta == -0.14
+    assert item.news_title == "ETF approval odds rise"
+
+
+def test_opposite_news_exit_triggers_for_same_entity_opposite_direction() -> None:
+    settings = build_test_settings(
+        paper_opposite_news_exit_enabled=True,
+        paper_opposite_news_min_confidence=0.70,
+        paper_opposite_news_min_relevance=0.60,
+        paper_opposite_news_min_token_overlap=1,
+    )
+
+    should_close, reason = evaluate_opposite_news_exit_case(
+        settings=settings,
+        position_side="YES",
+        position_query="trump crypto tax 2027",
+        candidate_direction="NO",
+        candidate_query="trump crypto tax",
+        candidate_confidence=0.84,
+        candidate_relevance=0.72,
+    )
+
+    assert should_close is True
+    assert reason == (
+        "opposite_news_thesis_break:YES->NO,"
+        "confidence=0.8400,relevance=0.7200,overlap=3"
+    )
+
+
+def test_opposite_news_exit_ignores_unrelated_opposite_direction() -> None:
+    settings = build_test_settings(
+        paper_opposite_news_exit_enabled=True,
+        paper_opposite_news_min_confidence=0.70,
+        paper_opposite_news_min_relevance=0.60,
+        paper_opposite_news_min_token_overlap=1,
+    )
+
+    should_close, reason = evaluate_opposite_news_exit_case(
+        settings=settings,
+        position_side="YES",
+        position_query="trump crypto tax 2027",
+        candidate_direction="NO",
+        candidate_query="fed rate cuts",
+        candidate_confidence=0.90,
+        candidate_relevance=0.90,
+    )
+
+    assert should_close is False
+    assert reason is None
+
+
+def test_opposite_news_exit_requires_confidence_gate() -> None:
+    settings = build_test_settings(
+        paper_opposite_news_exit_enabled=True,
+        paper_opposite_news_min_confidence=0.70,
+        paper_opposite_news_min_relevance=0.60,
+        paper_opposite_news_min_token_overlap=1,
+    )
+
+    should_close, reason = evaluate_opposite_news_exit_case(
+        settings=settings,
+        position_side="YES",
+        position_query="trump crypto tax 2027",
+        candidate_direction="NO",
+        candidate_query="trump crypto tax",
+        candidate_confidence=0.50,
+        candidate_relevance=0.90,
+    )
+
+    assert should_close is False
+    assert reason is None
 
 
 def test_select_exit_market_price_uses_no_price_for_no_side() -> None:

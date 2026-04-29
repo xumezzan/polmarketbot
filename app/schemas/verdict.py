@@ -21,3 +21,6 @@ class AnalysisRunResult(BaseModel):
     analysis_id: int
     created_new: bool
     verdict: Verdict
+    tradability_score: float | None = None
+    market_specificity_score: float | None = None
+    market_pipeline_skip_reason: str | None = None

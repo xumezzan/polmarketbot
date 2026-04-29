@@ -37,6 +37,20 @@ def test_news_normalizer_keeps_relevant_crypto_news() -> None:
     assert normalized.title == "SEC weighs new Bitcoin ETF approval path"
 
 
+def test_news_normalizer_keeps_single_domain_hit_with_hype_catalyst() -> None:
+    normalizer = NewsNormalizer(settings=build_test_settings(news_relevance_min_hits=2))
+    article = _build_article(
+        title="BlackRock files new tokenized fund after record inflows",
+        description="The filing is drawing fast market attention.",
+        content="Investors are watching whether the new product shifts sentiment.",
+    )
+
+    normalized = normalizer.normalize_article(article)
+
+    assert normalized is not None
+    assert normalized.title == "BlackRock files new tokenized fund after record inflows"
+
+
 def test_news_normalizer_filters_out_auction_noise() -> None:
     normalizer = NewsNormalizer(settings=build_test_settings())
     article = _build_article(

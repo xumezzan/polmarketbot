@@ -1,4 +1,5 @@
 from app.models.analysis import Analysis
+from app.models.anomaly import AnomalyHypothesis, AnomalyObservation
 from app.models.execution_intent import ExecutionIntent
 from app.models.base import Base
 from app.models.forecast_observation import ForecastObservation
@@ -15,6 +16,8 @@ from app.models.trade import PaperTrade
 
 __all__ = [
     "Analysis",
+    "AnomalyHypothesis",
+    "AnomalyObservation",
     "Base",
     "ExecutionIntent",
     "ForecastObservation",

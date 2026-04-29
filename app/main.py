@@ -9,6 +9,8 @@ from app.config import get_settings
 from app.database import get_db_session
 from app.logging_utils import log_event
 from app.repositories.analysis_repo import AnalysisRepository
+from app.repositories.anomaly_repo import AnomalyRepository
+from app.repositories.forecast_observation_repo import ForecastObservationRepository
 from app.repositories.reconciliation_repo import ReconciliationRepository
 from app.repositories.live_trade_repo import LiveTradeRepository
 from app.repositories.news_repo import NewsRepository
@@ -30,6 +32,9 @@ from app.schemas.admin import (
     SignalAuditResponse,
     RecentSignalsResponse,
 )
+from app.schemas.anomaly import AnomalyHunterAnalysisResult, AnomalyHunterReport
+from app.schemas.trade import PaperOpenPositionReport
+from app.schemas.trade import ForecastCalibrationReport
 from app.services.alerting import AlertingService, build_alert_client, get_alerting_runtime_status
 from app.services.monitor import MonitorService
 from app.services.operator import OperatorService
@@ -38,6 +43,9 @@ from app.schemas.telegram import TelegramUpdate
 from app.services.telegram_bot import TelegramBotService
 from app.schemas.live_execution import ReconciliationResult
 from app.services.reconciliation import ReconciliationService
+from app.services.paper_trader import get_paper_open_position_report
+from app.services.calibration_report import ForecastCalibrationReportService
+from app.services.anomaly_hunter import AnomalyHunter
 
 
 settings = get_settings()
@@ -138,14 +146,63 @@ async def admin_paper_stats(
     return await service.get_paper_stats()
 
 
+@app.get("/admin/paper/open-report", response_model=PaperOpenPositionReport)
+async def admin_paper_open_report(
+    session: AsyncSession = Depends(get_db_session),
+) -> PaperOpenPositionReport:
+    """Return read-only diagnostics for currently open paper positions."""
+    return await get_paper_open_position_report(session, settings)
+
+
+@app.get("/admin/paper/calibration", response_model=ForecastCalibrationReport)
+async def admin_paper_calibration(
+    window_days: int = Query(default=30, ge=1, le=365),
+    bucket_size: float = Query(default=0.10, gt=0, le=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> ForecastCalibrationReport:
+    """Return resolved forecast calibration metrics."""
+    service = ForecastCalibrationReportService(
+        observation_repository=ForecastObservationRepository(session)
+    )
+    return await service.build_report(window_days=window_days, bucket_size=bucket_size)
+
+
 @app.get("/admin/paper/proof-of-edge", response_model=ProofOfEdgeResponse)
 async def admin_proof_of_edge(
-    window_days: int = Query(default=7, ge=3, le=30),
+    window_days: int = Query(default=30, ge=14, le=365),
     session: AsyncSession = Depends(get_db_session),
 ) -> ProofOfEdgeResponse:
     """Return phase-1 proof-of-edge gate report."""
     service = _build_operator_service(session)
     return await service.get_proof_of_edge_report(window_days=window_days)
+
+
+@app.get("/admin/anomaly-hunter/report", response_model=AnomalyHunterReport)
+async def admin_anomaly_hunter_report(
+    window_hours: int = Query(default=24, ge=1, le=168),
+    session: AsyncSession = Depends(get_db_session),
+) -> AnomalyHunterReport:
+    """Return recent Anomaly Hunter hypotheses."""
+    service = AnomalyHunter(
+        settings=settings,
+        anomaly_repository=AnomalyRepository(session),
+        scheduler_cycle_repository=SchedulerCycleRepository(session),
+    )
+    return await service.build_report(window_hours=window_hours)
+
+
+@app.post("/admin/anomaly-hunter/analyze", response_model=AnomalyHunterAnalysisResult)
+async def admin_anomaly_hunter_analyze(
+    window_hours: int = Query(default=settings.anomaly_hunter_analysis_interval_hours, ge=1, le=168),
+    session: AsyncSession = Depends(get_db_session),
+) -> AnomalyHunterAnalysisResult:
+    """Run one read-only Anomaly Hunter analysis pass."""
+    service = AnomalyHunter(
+        settings=settings,
+        anomaly_repository=AnomalyRepository(session),
+        scheduler_cycle_repository=SchedulerCycleRepository(session),
+    )
+    return await service.analyze_recent(window_hours=window_hours)
 
 
 @app.get("/admin/verify", response_model=SystemVerificationReport)

@@ -1,3 +1,5 @@
+import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -405,3 +407,61 @@ async def test_gamma_market_client_retries_rate_limit_then_succeeds(
     assert len(markets) == 1
     assert markets[0].id == "stub-btc-100k"
     assert len(request_log) == 3
+
+
+@pytest.mark.asyncio
+async def test_gamma_market_client_uses_cache_when_live_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    market_payload = {
+        "id": "cached-btc-100k",
+        "question": "Will Bitcoin reach $100,000 by December 31, 2026?",
+        "slug": "bitcoin-100k-by-end-of-2026",
+        "conditionId": "cond-btc-100k",
+        "liquidity": "245000.5",
+        "active": True,
+        "closed": False,
+        "outcomes": "[\"Yes\", \"No\"]",
+        "outcomePrices": "[\"0.59\", \"0.41\"]",
+    }
+    cache_path = tmp_path / "gamma_markets.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "markets": [market_payload],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url: str, params: dict[str, object] | None = None):
+            raise httpx.ConnectError("dns failed")
+
+    monkeypatch.setattr("app.services.market_client.httpx.AsyncClient", FakeAsyncClient)
+
+    client = GammaPolymarketClient(
+        build_test_settings(
+            market_fetch_mode="gamma",
+            gamma_retry_max_attempts=1,
+            gamma_retry_base_delay_seconds=0,
+            gamma_market_cache_enabled=True,
+            gamma_market_cache_path=str(cache_path),
+            gamma_market_cache_max_age_minutes=120,
+        )
+    )
+    markets = await client.fetch_markets()
+
+    assert len(markets) == 1
+    assert markets[0].id == "cached-btc-100k"

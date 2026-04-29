@@ -149,42 +149,26 @@ async def test_phase_gate_report_holds_when_not_enough_closed_trades(monkeypatch
     )
 
     assert report.verdict == "HOLD"
-    assert "need_more_closed_trades:4<10" in report.reasons
+    assert "need_more_runtime:2<14" in report.reasons
+    assert "need_more_closed_trades:4<30" in report.reasons
 
 
 @pytest.mark.asyncio
 async def test_phase_gate_report_passes_when_metrics_are_good(monkeypatch) -> None:
     analytics = _build_analytics(
-        closed_trades=12,
-        total_pnl=6.0,
+        closed_trades=42,
+        total_pnl=14.0,
         daily=[
             PaperTradeDailyAnalytics(
-                date="2026-04-21",
-                opened_trades=4,
-                closed_trades=4,
-                winning_trades=3,
-                losing_trades=1,
-                total_pnl=2.0,
-                avg_pnl=0.5,
-            ),
-            PaperTradeDailyAnalytics(
-                date="2026-04-22",
-                opened_trades=4,
-                closed_trades=4,
+                date=f"2026-04-{day:02d}",
+                opened_trades=3,
+                closed_trades=3,
                 winning_trades=2,
-                losing_trades=2,
-                total_pnl=2.0,
-                avg_pnl=0.5,
-            ),
-            PaperTradeDailyAnalytics(
-                date="2026-04-23",
-                opened_trades=4,
-                closed_trades=4,
-                winning_trades=3,
                 losing_trades=1,
-                total_pnl=2.0,
-                avg_pnl=0.5,
-            ),
+                total_pnl=1.0,
+                avg_pnl=0.3333,
+            )
+            for day in range(1, 15)
         ],
     )
 
@@ -203,26 +187,17 @@ async def test_phase_gate_report_passes_when_metrics_are_good(monkeypatch) -> No
     service.scheduler_cycle_repository.list_since = AsyncMock(
         return_value=[
             SimpleNamespace(
-                started_at=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+                started_at=datetime(2026, 4, day, 12, 0, tzinfo=UTC),
                 status="COMPLETED",
                 error_count=0,
-            ),
-            SimpleNamespace(
-                started_at=datetime(2026, 4, 22, 12, 0, tzinfo=UTC),
-                status="COMPLETED",
-                error_count=0,
-            ),
-            SimpleNamespace(
-                started_at=datetime(2026, 4, 23, 12, 0, tzinfo=UTC),
-                status="COMPLETED",
-                error_count=0,
-            ),
+            )
+            for day in range(1, 15)
         ]
     )
 
     report = await service.build_phase_gate_report(
         settings=build_test_settings(),
-        window_days=7,
+        window_days=30,
     )
 
     assert report.verdict == "PASS"

@@ -104,6 +104,15 @@ class RiskEngine:
         has_existing_position = await self.trade_repository.has_open_position_for_market(
             market_id=signal.market_id
         )
+        (
+            duplicate_position_allowed,
+            duplicate_best_existing_edge,
+            duplicate_edge_improvement,
+            duplicate_context_reason,
+        ) = await self._duplicate_position_context(
+            signal=signal,
+            has_existing_position=has_existing_position,
+        )
         query_text = self._load_effective_market_query(signal)
         entity_tokens = _extract_query_entity_tokens(
             query_text=query_text,
@@ -150,6 +159,7 @@ class RiskEngine:
             query_text=query_text,
             market_question=candidate.question,
             existing_open_position=has_existing_position,
+            duplicate_position_allowed=duplicate_position_allowed,
             entity_key=entity_key,
             entity_open_positions_count=entity_open_positions_count,
             entity_open_exposure_used_usd=entity_open_exposure_used_usd,
@@ -222,6 +232,11 @@ class RiskEngine:
                 "max_yes_entry_slippage": self.settings.risk_max_yes_entry_slippage,
                 "daily_exposure_used_usd": round(daily_exposure_used, 2),
                 "existing_open_position": has_existing_position,
+                "duplicate_position_allowed": duplicate_position_allowed,
+                "duplicate_best_existing_edge": duplicate_best_existing_edge,
+                "duplicate_edge_improvement": duplicate_edge_improvement,
+                "duplicate_context_reason": duplicate_context_reason,
+                "duplicate_min_edge_improvement": self.settings.risk_duplicate_min_edge_improvement,
                 "analysis_trade_count": analysis_trade_count,
                 "max_trades_per_analysis": self.settings.risk_max_trades_per_analysis,
                 "top_match_score": top_match_score,
@@ -366,6 +381,50 @@ class RiskEngine:
         )
         return capped_size * size_multiplier
 
+    async def _duplicate_position_context(
+        self,
+        *,
+        signal: Signal,
+        has_existing_position: bool,
+    ) -> tuple[bool, float | None, float | None, str | None]:
+        if not has_existing_position:
+            return False, None, None, None
+
+        if not self.settings.risk_allow_stronger_duplicate_position:
+            return False, None, None, "stronger_duplicate_disabled"
+
+        analysis = signal.analysis
+        if analysis is None:
+            return False, None, None, "missing_analysis"
+
+        open_positions = await self.trade_repository.list_open_positions()
+        same_market_positions = [
+            position
+            for position in open_positions
+            if position.market_id == signal.market_id
+        ]
+        same_side_positions = [
+            position
+            for position in same_market_positions
+            if position.side.value == analysis.direction.value
+        ]
+        if not same_side_positions:
+            return False, None, None, "existing_position_opposite_side"
+
+        existing_edges = [
+            float(position.signal.edge)
+            for position in same_side_positions
+            if position.signal is not None and position.signal.edge is not None
+        ]
+        if not existing_edges:
+            return False, None, None, "existing_position_missing_edge"
+
+        best_existing_edge = max(existing_edges)
+        edge_improvement = round(float(signal.edge) - best_existing_edge, 6)
+        allowed = edge_improvement >= self.settings.risk_duplicate_min_edge_improvement
+        reason = "stronger_duplicate_allowed" if allowed else "duplicate_edge_improvement_too_low"
+        return allowed, round(best_existing_edge, 6), edge_improvement, reason
+
     async def _entity_exposure_context(
         self,
         *,
@@ -460,6 +519,7 @@ def evaluate_risk_case(
     top_candidate_score_delta: float | None = None,
     query_text: str = "",
     market_question: str = "",
+    duplicate_position_allowed: bool = False,
 ) -> RiskCheckResult:
     """
     Pure deterministic helper for local verification and unit tests.
@@ -552,6 +612,7 @@ def evaluate_risk_case(
     if (
         settings.risk_block_on_existing_position
         and existing_open_position
+        and not duplicate_position_allowed
     ):
         blockers.append("duplicate_market_position_exists")
 

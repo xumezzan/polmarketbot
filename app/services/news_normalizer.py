@@ -12,19 +12,40 @@ class NewsNormalizer:
     TRACKING_QUERY_PREFIXES = ("utm_",)
     TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
     RELEVANT_KEYWORDS = {
+        "ai",
+        "artificial intelligence",
         "bitcoin",
         "btc",
         "ethereum",
         "eth",
         "xrp",
         "solana",
+        "sol",
+        "dogecoin",
+        "doge",
         "crypto",
         "cryptocurrency",
         "blockchain",
+        "stablecoin",
+        "stablecoins",
         "etf",
         "sec",
+        "cftc",
+        "coinbase",
+        "binance",
+        "blackrock",
+        "microstrategy",
+        "strategy",
+        "tesla",
+        "elon",
+        "musk",
+        "spacex",
+        "openai",
+        "nvidia",
         "federal reserve",
         "fed",
+        "powell",
+        "fomc",
         "interest rate",
         "rate cut",
         "rate hike",
@@ -48,8 +69,50 @@ class NewsNormalizer:
         "ukraine",
         "israel",
         "iran",
+        "ceasefire",
+        "nato",
         "oil",
         "gold",
+    }
+    HYPE_KEYWORDS = {
+        "approval",
+        "approves",
+        "approved",
+        "ban",
+        "bans",
+        "breakout",
+        "crash",
+        "crashes",
+        "cuts",
+        "delay",
+        "delays",
+        "denies",
+        "denied",
+        "files",
+        "filing",
+        "hack",
+        "hacked",
+        "inflow",
+        "inflows",
+        "investigation",
+        "launch",
+        "lawsuit",
+        "milestone",
+        "record",
+        "regulation",
+        "resigns",
+        "ruling",
+        "rumor",
+        "rumour",
+        "sanction",
+        "sanctions",
+        "shock",
+        "soars",
+        "surge",
+        "surges",
+        "tariff",
+        "tariffs",
+        "whale",
     }
     BLOCKED_KEYWORDS = {
         "auction",
@@ -156,7 +219,13 @@ class NewsNormalizer:
         keyword_hits = sum(
             1 for keyword in self.RELEVANT_KEYWORDS if self._contains_keyword(text, keyword)
         )
-        return keyword_hits >= self.settings.news_relevance_min_hits
+        if keyword_hits >= self.settings.news_relevance_min_hits:
+            return True
+
+        hype_hits = sum(
+            1 for keyword in self.HYPE_KEYWORDS if self._contains_keyword(text, keyword)
+        )
+        return keyword_hits >= 1 and hype_hits >= 1
 
     def _contains_keyword(self, text: str, keyword: str) -> bool:
         escaped = re.escape(keyword.lower())

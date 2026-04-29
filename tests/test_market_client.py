@@ -4,6 +4,7 @@ from app.services.market_client import (
     extract_market_domain_anchor_tokens,
     filter_markets_by_query_domain,
     infer_market_contract_type,
+    is_market_domain_compatible,
     market_contract_compatibility,
     normalize_market_query,
 )
@@ -41,6 +42,7 @@ def test_normalize_market_query_keeps_non_bitcoin_assets_compact() -> None:
     assert normalize_market_query("Ethereum transaction volume increase") == "ethereum volume"
     assert normalize_market_query("XRP price prediction") == "xrp"
     assert normalize_market_query("CLARITY Act approval") == "clarity act crypto"
+    assert normalize_market_query("clarty act senate action 2026") == "clarity act crypto"
 
 
 def test_extract_market_domain_anchor_tokens_prefers_specific_assets() -> None:
@@ -180,6 +182,88 @@ def test_filter_markets_by_query_domain_avoids_legal_query_geography_matches() -
             query_text="wisconsin market lawsuit",
         )
         == []
+    )
+
+
+def test_market_domain_compatibility_rejects_breach_false_friends() -> None:
+    data_center = GammaMarket.model_validate(
+        {
+            "id": "ai-data-center",
+            "question": "AI data center moratorium passed before 2027?",
+            "slug": "ai-data-center-moratorium-before-2027",
+        }
+    )
+    sports_team = GammaMarket.model_validate(
+        {
+            "id": "boston-breach",
+            "question": "Will Boston Breach finish in the top 4 of the CDL Regular Season?",
+            "slug": "boston-breach-top-4-cdl-regular-season",
+        }
+    )
+
+    assert (
+        is_market_domain_compatible(
+            query_text="polymarket data breach 2026",
+            market=data_center,
+        )
+        is False
+    )
+    assert (
+        is_market_domain_compatible(
+            query_text="polymarket data breach 2026",
+            market=sports_team,
+        )
+        is False
+    )
+
+
+def test_market_domain_compatibility_requires_atm_for_crypto_atm_queries() -> None:
+    liquidation = GammaMarket.model_validate(
+        {
+            "id": "crypto-liquidation",
+            "question": "Record crypto liquidation in 2026?",
+            "slug": "record-crypto-liquidation-in-2026",
+        }
+    )
+    atm_market = GammaMarket.model_validate(
+        {
+            "id": "crypto-atm",
+            "question": "Will Canada ban crypto ATMs before 2027?",
+            "slug": "canada-ban-crypto-atms-before-2027",
+        }
+    )
+
+    assert (
+        is_market_domain_compatible(
+            query_text="canada crypto atm ban 2026",
+            market=liquidation,
+        )
+        is False
+    )
+    assert (
+        is_market_domain_compatible(
+            query_text="canada crypto atm ban 2026",
+            market=atm_market,
+        )
+        is True
+    )
+
+
+def test_market_domain_compatibility_rejects_wrong_act_for_clarity_queries() -> None:
+    insurrection = GammaMarket.model_validate(
+        {
+            "id": "insurrection-act",
+            "question": "Insurrection Act invoked by December 31?",
+            "slug": "insurrection-act-invoked-by-december-31",
+        }
+    )
+
+    assert (
+        is_market_domain_compatible(
+            query_text="clarity act senate action 2026",
+            market=insurrection,
+        )
+        is False
     )
 
 

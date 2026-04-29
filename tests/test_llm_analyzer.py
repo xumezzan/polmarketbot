@@ -6,7 +6,10 @@ from app.services.llm_analyzer import (
     OpenAILLMClient,
     StubLLMClient,
     build_llm_client,
+    resolve_market_pipeline_skip_reason,
+    score_verdict_market_readiness,
 )
+from app.schemas.verdict import Verdict
 from tests.helpers import build_test_settings
 
 
@@ -20,7 +23,7 @@ def test_stub_llm_maps_bullish_bitcoin_etf_news_to_specific_market() -> None:
 
     assert verdict.direction == "YES"
     assert verdict.market_query == "bitcoin 150k june 2026"
-    assert verdict.fair_probability == 0.67
+    assert verdict.fair_probability == 0.69
     assert raw_response is not None
     assert raw_response["provider"] == "stub"
 
@@ -110,3 +113,57 @@ def test_openai_prompt_discourages_vague_crypto_queries() -> None:
     assert "concrete, currently plausible binary prediction market" in prompt
     assert "crypto security AI impact" in prompt
     assert "Do not infer a trade only from general sentiment" in prompt
+
+
+def test_market_readiness_scores_concrete_directional_queries() -> None:
+    verdict = Verdict(
+        relevance=0.78,
+        confidence=0.74,
+        direction="YES",
+        fair_probability=0.66,
+        market_query="canada crypto atm ban 2026",
+        reason="Canada is considering a crypto ATM ban, which maps to a regulation market.",
+    )
+
+    scores = score_verdict_market_readiness(
+        verdict=verdict,
+        title="Canada Eyes Crypto ATM Ban in Anti-Fraud Crackdown",
+        content="The federal government is considering a ban on crypto ATMs.",
+    )
+
+    assert scores["tradability_score"] >= 0.35
+    assert scores["market_specificity_score"] >= 0.35
+    assert (
+        resolve_market_pipeline_skip_reason(
+            settings=build_test_settings(),
+            verdict=verdict,
+            scores=scores,
+        )
+        is None
+    )
+
+
+def test_market_readiness_skips_generic_directional_queries() -> None:
+    verdict = Verdict(
+        relevance=0.62,
+        confidence=0.58,
+        direction="YES",
+        fair_probability=0.57,
+        market_query="general news",
+        reason="The article is broad commentary without a concrete market.",
+    )
+
+    scores = score_verdict_market_readiness(
+        verdict=verdict,
+        title="Crypto executives debate future market impact",
+        content="The article discusses broad crypto sentiment.",
+    )
+
+    assert (
+        resolve_market_pipeline_skip_reason(
+            settings=build_test_settings(),
+            verdict=verdict,
+            scores=scores,
+        )
+        == "tradability_score_below_threshold:0.2500<0.3500"
+    )

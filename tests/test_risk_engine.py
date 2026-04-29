@@ -48,6 +48,56 @@ def test_risk_engine_blocks_stale_duplicate_and_daily_limit() -> None:
     assert result.approved_size_usd == 0.0
 
 
+def test_risk_engine_allows_existing_position_when_stronger_duplicate_is_approved() -> None:
+    settings = build_test_settings(
+        risk_allow_stronger_duplicate_position=True,
+        risk_max_daily_exposure_usd=250.0,
+    )
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=45,
+        liquidity=200000.0,
+        edge=0.24,
+        match_score=0.55,
+        existing_open_position=True,
+        duplicate_position_allowed=True,
+        daily_exposure_used_usd=20.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is True
+    assert "duplicate_market_position_exists" not in result.blockers
+    assert result.approved_size_usd == 50.0
+
+
+def test_risk_engine_still_blocks_existing_position_without_stronger_duplicate_override() -> None:
+    settings = build_test_settings(risk_allow_stronger_duplicate_position=True)
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        news_age_minutes=45,
+        liquidity=200000.0,
+        edge=0.24,
+        match_score=0.55,
+        existing_open_position=True,
+        duplicate_position_allowed=False,
+        daily_exposure_used_usd=20.0,
+        query_text="Bitcoin price prediction",
+        market_question="Will Bitcoin hit $150k by June 30, 2026?",
+    )
+
+    assert result.allow is False
+    assert "duplicate_market_position_exists" in result.blockers
+
+
 def test_risk_engine_blocks_low_liquidity_and_priced_in_signal() -> None:
     settings = build_test_settings()
 

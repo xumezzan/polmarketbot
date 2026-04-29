@@ -3,7 +3,9 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.analysis import Analysis
 from app.models.forecast_observation import ForecastObservation
+from app.models.news import NewsItem
 
 
 class ForecastObservationRepository:
@@ -152,3 +154,22 @@ class ForecastObservationRepository:
             stmt = stmt.where(ForecastObservation.model == model)
         value = (await self.session.execute(stmt)).scalar_one_or_none()
         return None if value is None else float(value)
+
+    async def list_with_analysis_context(
+        self,
+        *,
+        since: datetime | None = None,
+        limit: int = 5000,
+    ) -> list[tuple[ForecastObservation, Analysis | None, NewsItem | None]]:
+        """Return resolved observations with linked analysis and news context."""
+        stmt = (
+            sa.select(ForecastObservation, Analysis, NewsItem)
+            .outerjoin(Analysis, ForecastObservation.analysis_id == Analysis.id)
+            .outerjoin(NewsItem, Analysis.news_item_id == NewsItem.id)
+            .order_by(ForecastObservation.resolved_at.desc())
+            .limit(limit)
+        )
+        if since is not None:
+            stmt = stmt.where(ForecastObservation.resolved_at >= since)
+        rows = (await self.session.execute(stmt)).all()
+        return [(row[0], row[1], row[2]) for row in rows]

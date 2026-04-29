@@ -11,12 +11,19 @@ from app.database import AsyncSessionLocal, engine
 from app.logging_utils import configure_logging, log_event
 from app.models.news import NewsItem
 from app.models.enums import SignalStatus
+from app.repositories.anomaly_repo import AnomalyRepository
 from app.repositories.news_repo import NewsRepository
 from app.repositories.operator_state_repo import OperatorStateRepository
 from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.schemas.news import NewsImportResult
 from app.schemas.scheduler import PipelineItemResult, SchedulerCycleResult
 from app.services.alerting import AlertingService, build_alert_client
+from app.services.anomaly_hunter import (
+    AnomalyHunter,
+    run_anomaly_hunter_analysis,
+    run_anomaly_hunter_observe_cycle,
+    run_anomaly_hunter_report,
+)
 from app.services.daily_report import run_daily_report
 from app.services.live_execution import (
     CircuitBreakerTriggeredError,
@@ -111,6 +118,7 @@ class PipelineScheduler:
             client=build_alert_client(settings),
         )
         self._last_daily_report_date: str | None = None
+        self._last_anomaly_hunter_report_date: str | None = None
         self._active_cycle_id: str | None = None
 
     async def run_cycle(self, *, cycle_number: int = 1) -> SchedulerCycleResult:
@@ -244,23 +252,34 @@ class PipelineScheduler:
                         )
                         item_result.analysis_id = analysis_result.analysis_id
 
-                        if should_skip_market_pipeline_for_direction(
-                            analysis_result.verdict.direction
-                        ):
+                        market_skip_reason = (
+                            analysis_result.market_pipeline_skip_reason
+                            or (
+                                "neutral_verdict"
+                                if should_skip_market_pipeline_for_direction(
+                                    analysis_result.verdict.direction
+                                )
+                                else None
+                            )
+                        )
+                        if market_skip_reason is not None:
                             item_result.market_candidate_count = 0
                             log_event(
                                 logger,
-                                "scheduler_news_item_skipped_neutral_verdict",
+                                "scheduler_news_item_skipped_market_pipeline",
                                 cycle_id=cycle_id,
                                 news_item_id=news_item.id,
                                 analysis_id=analysis_result.analysis_id,
                                 market_query=analysis_result.verdict.market_query,
+                                reason=market_skip_reason,
+                                tradability_score=analysis_result.tradability_score,
+                                market_specificity_score=analysis_result.market_specificity_score,
                             )
                             self._dashboard_log(
                                 "SKIP",
                                 (
                                     f"news #{news_item.id} analysis "
-                                    f"#{analysis_result.analysis_id} direction=NONE"
+                                    f"#{analysis_result.analysis_id} {market_skip_reason}"
                                 ),
                                 style="yellow",
                             )
@@ -553,6 +572,7 @@ class PipelineScheduler:
                 closed_trade_ids=result.closed_trade_ids,
                 error_count=result.error_count,
             )
+            await self._run_anomaly_hunter_after_cycle(result=result)
             await self.alerting_service.send_cycle_summary(result)
             if self.dashboard is not None:
                 self.dashboard.cycle_completed(result)
@@ -583,6 +603,7 @@ class PipelineScheduler:
                 if self.dashboard is None:
                     print(result.model_dump_json())
                 await self._maybe_send_daily_report(cycle_number=cycle_number)
+                await self._maybe_send_anomaly_hunter_report(cycle_number=cycle_number)
             except Exception as exc:
                 log_event(
                     logger,
@@ -620,6 +641,7 @@ class PipelineScheduler:
                     cycle_number=cycle_number,
                 )
                 await self._maybe_send_daily_report(cycle_number=cycle_number)
+                await self._maybe_send_anomaly_hunter_report(cycle_number=cycle_number)
                 if not self.settings.scheduler_continue_on_item_error:
                     self._active_cycle_id = None
                     raise
@@ -793,6 +815,84 @@ class PipelineScheduler:
             log_event(
                 logger,
                 "daily_report_failed",
+                cycle_number=cycle_number,
+                error=str(exc),
+            )
+
+    async def _run_anomaly_hunter_after_cycle(self, *, result: SchedulerCycleResult) -> None:
+        if not self.settings.anomaly_hunter_enabled:
+            return
+
+        try:
+            async with AsyncSessionLocal() as session:
+                observations_created = await run_anomaly_hunter_observe_cycle(
+                    session,
+                    self.settings,
+                    result=result,
+                )
+                hunter = AnomalyHunter(
+                    settings=self.settings,
+                    anomaly_repository=AnomalyRepository(session),
+                    scheduler_cycle_repository=SchedulerCycleRepository(session),
+                )
+                if await hunter.should_analyze_now():
+                    analysis = await run_anomaly_hunter_analysis(
+                        session,
+                        self.settings,
+                        window_hours=max(self.settings.anomaly_hunter_analysis_interval_hours, 1),
+                    )
+                else:
+                    analysis = None
+            log_event(
+                logger,
+                "anomaly_hunter_cycle_processed",
+                cycle_id=result.cycle_id,
+                observations_created=observations_created,
+                hypotheses_created=analysis.hypotheses_created if analysis is not None else 0,
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                "anomaly_hunter_cycle_failed",
+                cycle_id=result.cycle_id,
+                error=str(exc),
+            )
+
+    async def _maybe_send_anomaly_hunter_report(self, *, cycle_number: int) -> None:
+        if not self.settings.alert_on_daily_report or not self.settings.anomaly_hunter_enabled:
+            return
+
+        now = datetime.now(UTC)
+        report_date = now.date().isoformat()
+        if self._last_anomaly_hunter_report_date == report_date:
+            return
+
+        target_hour = min(max(self.settings.anomaly_hunter_daily_report_hour_utc, 0), 23)
+        if now.hour < target_hour:
+            return
+
+        try:
+            async with AsyncSessionLocal() as session:
+                report = await run_anomaly_hunter_report(
+                    session,
+                    self.settings,
+                    window_hours=24,
+                )
+            dispatch = await self.alerting_service.send_anomaly_hunter_report(report=report)
+            self._last_anomaly_hunter_report_date = report_date
+            log_event(
+                logger,
+                "anomaly_hunter_report_sent",
+                cycle_number=cycle_number,
+                report_date=report_date,
+                delivered=dispatch.delivered,
+                mode=dispatch.mode,
+                error=dispatch.error,
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                "anomaly_hunter_report_failed",
                 cycle_number=cycle_number,
                 error=str(exc),
             )

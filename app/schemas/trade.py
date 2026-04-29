@@ -58,6 +58,8 @@ class PaperTradeAutoCloseDecision(BaseModel):
     close_reason: str | None = None
     current_price: float | None = None
     current_price_delta: float | None = None
+    current_edge: float | None = None
+    edge_delta: float | None = None
     holding_minutes: float | None = None
     error: str | None = None
 
@@ -72,6 +74,52 @@ class PaperTradeMaintenanceResult(BaseModel):
     closed_results: list["PaperTradeCloseResult"] = Field(default_factory=list)
     decisions: list[PaperTradeAutoCloseDecision] = Field(default_factory=list)
     observation_sync: ForecastObservationSyncResult | None = None
+
+
+class PaperOpenPositionReportItem(BaseModel):
+    """Read-only diagnostics for one open paper position."""
+
+    position_id: int
+    trade_id: int | None = None
+    signal_id: int
+    analysis_id: int | None = None
+    news_item_id: int | None = None
+    news_title: str | None = None
+    news_source: str | None = None
+    market_id: str
+    market_question: str | None = None
+    market_query: str | None = None
+    side: str
+    entry_price: float
+    current_price: float | None = None
+    current_price_delta: float | None = None
+    size_usd: float
+    shares: float
+    fair_probability: float | None = None
+    entry_edge: float | None = None
+    current_edge: float | None = None
+    edge_delta: float | None = None
+    opened_at: str
+    holding_minutes: float
+    action: str
+    close_reason: str | None = None
+    opposite_news_reason: str | None = None
+    liquidity: float | None = None
+    best_bid: float | None = None
+    best_ask: float | None = None
+    last_trade_price: float | None = None
+    error: str | None = None
+
+
+class PaperOpenPositionReport(BaseModel):
+    """Read-only diagnostics report for all open paper positions."""
+
+    generated_at: str
+    count: int = 0
+    would_close_count: int = 0
+    held_count: int = 0
+    skipped_count: int = 0
+    items: list[PaperOpenPositionReportItem] = Field(default_factory=list)
 
 
 class PaperTradeStats(BaseModel):
@@ -140,6 +188,54 @@ class PaperRiskBlockerCount(BaseModel):
 
     blocker: str
     count: int
+
+
+class ForecastCalibrationBucket(BaseModel):
+    """Reliability bucket for resolved forecast probabilities."""
+
+    bucket: str
+    count: int = 0
+    avg_raw_probability: float = 0.0
+    avg_calibrated_probability: float = 0.0
+    actual_frequency: float = 0.0
+    calibration_error: float = 0.0
+    avg_raw_brier: float = 0.0
+    avg_calibrated_brier: float = 0.0
+    avg_raw_log_loss: float = 0.0
+    avg_calibrated_log_loss: float = 0.0
+
+
+class ForecastCalibrationBreakdown(BaseModel):
+    """Calibration metrics grouped by one operator-facing dimension."""
+
+    key: str
+    count: int = 0
+    avg_calibrated_probability: float = 0.0
+    actual_frequency: float = 0.0
+    calibration_error: float = 0.0
+    avg_calibrated_brier: float = 0.0
+    avg_calibrated_log_loss: float = 0.0
+
+
+class ForecastCalibrationReport(BaseModel):
+    """Resolved forecast calibration report for paper-trading validation."""
+
+    generated_at: str
+    window_days: int | None = None
+    resolved_observations: int = 0
+    avg_raw_probability: float | None = None
+    avg_calibrated_probability: float | None = None
+    actual_frequency: float | None = None
+    avg_raw_brier: float | None = None
+    avg_calibrated_brier: float | None = None
+    avg_raw_log_loss: float | None = None
+    avg_calibrated_log_loss: float | None = None
+    weighted_calibration_error: float | None = None
+    buckets: list[ForecastCalibrationBucket] = Field(default_factory=list)
+    by_source: list[ForecastCalibrationBreakdown] = Field(default_factory=list)
+    by_model: list[ForecastCalibrationBreakdown] = Field(default_factory=list)
+    by_topic: list[ForecastCalibrationBreakdown] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class PaperTradeFunnelStats(BaseModel):

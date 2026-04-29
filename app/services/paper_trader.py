@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import re
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 
@@ -19,6 +20,8 @@ from app.runtime_flags import RUNTIME_FLAG_PAPER_TRADING_KILL_SWITCH
 from app.schemas.risk import RiskDecision
 from app.schemas.forecast_observation import ForecastObservationSyncResult
 from app.schemas.trade import (
+    PaperOpenPositionReport,
+    PaperOpenPositionReportItem,
     PaperRiskBlockerCount,
     PaperTradeAnalytics,
     PaperTradeAnalyticsSummary,
@@ -88,6 +91,8 @@ def evaluate_auto_close_case(
     entry_price: float,
     current_price: float,
     holding_minutes: float,
+    entry_edge: float | None = None,
+    current_edge: float | None = None,
 ) -> tuple[bool, str | None, float]:
     """Return whether one paper position should be auto-closed now."""
     delta = round(current_price - entry_price, 4)
@@ -112,6 +117,32 @@ def evaluate_auto_close_case(
             delta,
         )
 
+    if (
+        settings.paper_edge_exit_enabled
+        and holding_minutes >= settings.paper_edge_exit_grace_minutes
+        and entry_edge is not None
+        and current_edge is not None
+    ):
+        edge_delta = round(current_edge - entry_edge, 4)
+        if current_edge <= settings.paper_min_current_edge:
+            return (
+                True,
+                (
+                    f"edge_evaporated:{current_edge:.4f}<="
+                    f"{settings.paper_min_current_edge:.4f}"
+                ),
+                delta,
+            )
+        if edge_delta <= -settings.paper_max_edge_deterioration:
+            return (
+                True,
+                (
+                    f"edge_deteriorated:{edge_delta:.4f}<="
+                    f"-{settings.paper_max_edge_deterioration:.4f}"
+                ),
+                delta,
+            )
+
     if holding_minutes >= settings.paper_max_hold_minutes:
         return (
             True,
@@ -123,6 +154,95 @@ def evaluate_auto_close_case(
         )
 
     return False, None, delta
+
+
+def calculate_current_edge(
+    *,
+    fair_probability: float | None,
+    current_price: float,
+) -> float | None:
+    """Return side-aligned current edge for an open paper position."""
+    if fair_probability is None:
+        return None
+    return round(float(fair_probability) - current_price, 4)
+
+
+def evaluate_opposite_news_exit_case(
+    *,
+    settings: Settings,
+    position_side: str,
+    position_query: str | None,
+    candidate_direction: str,
+    candidate_query: str | None,
+    candidate_confidence: float,
+    candidate_relevance: float,
+) -> tuple[bool, str | None]:
+    """Return whether a fresh opposite verdict should invalidate an open thesis."""
+    if not settings.paper_opposite_news_exit_enabled:
+        return False, None
+
+    normalized_side = position_side.upper()
+    normalized_direction = candidate_direction.upper()
+    if normalized_direction == VerdictDirection.NONE.value:
+        return False, None
+    if normalized_direction == normalized_side:
+        return False, None
+    if candidate_confidence < settings.paper_opposite_news_min_confidence:
+        return False, None
+    if candidate_relevance < settings.paper_opposite_news_min_relevance:
+        return False, None
+
+    overlap = _query_token_overlap(position_query or "", candidate_query or "")
+    if overlap < settings.paper_opposite_news_min_token_overlap:
+        return False, None
+
+    return (
+        True,
+        (
+            "opposite_news_thesis_break:"
+            f"{normalized_side}->{normalized_direction},"
+            f"confidence={candidate_confidence:.4f},"
+            f"relevance={candidate_relevance:.4f},"
+            f"overlap={overlap}"
+        ),
+    )
+
+
+def _query_token_overlap(left: str, right: str) -> int:
+    return len(_query_tokens(left) & _query_tokens(right))
+
+
+def _query_tokens(value: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", value.lower())
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "by",
+        "for",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "will",
+    }
+    generic = {
+        "2026",
+        "2027",
+        "market",
+        "markets",
+        "news",
+        "price",
+        "prediction",
+    }
+    return {
+        token
+        for token in tokens
+        if token not in stopwords and token not in generic and len(token) > 1
+    }
 
 
 def build_paper_trade_analytics(
@@ -318,6 +438,11 @@ def _build_breakdown(
 def _normalize_blocker_name(blocker: str) -> str:
     """Collapse parameterized blocker strings into stable blocker categories."""
     return blocker.split(":", 1)[0]
+
+
+def _enum_value(value) -> str:
+    """Return an enum value while keeping tests with simple strings easy to build."""
+    return str(value.value if hasattr(value, "value") else value)
 
 
 class PaperTrader:
@@ -699,6 +824,179 @@ class PaperTrader:
         )
         return analytics
 
+    async def inspect_open_positions(self) -> PaperOpenPositionReport:
+        """Return read-only diagnostics for open paper positions without closing them."""
+        generated_at = datetime.now(UTC)
+        open_positions = await self.trade_repository.list_open_positions()
+        items: list[PaperOpenPositionReportItem] = []
+
+        for position in open_positions:
+            trade = await self.trade_repository.get_open_trade_for_position(position_id=position.id)
+            market = await self.market_client.fetch_market(position.market_id)
+            opposite_news_reason = await self._opposite_news_exit_reason(position=position)
+            items.append(
+                self._build_open_position_report_item(
+                    position=position,
+                    trade=trade,
+                    market=market,
+                    generated_at=generated_at,
+                    opposite_news_reason=opposite_news_reason,
+                )
+            )
+
+        would_close_count = sum(1 for item in items if item.action == "WOULD_CLOSE")
+        held_count = sum(1 for item in items if item.action == "HELD")
+        skipped_count = sum(1 for item in items if item.action == "SKIPPED")
+        return PaperOpenPositionReport(
+            generated_at=generated_at.isoformat(),
+            count=len(items),
+            would_close_count=would_close_count,
+            held_count=held_count,
+            skipped_count=skipped_count,
+            items=items,
+        )
+
+    def _build_open_position_report_item(
+        self,
+        *,
+        position,
+        trade,
+        market,
+        generated_at: datetime,
+        opposite_news_reason: str | None,
+    ) -> PaperOpenPositionReportItem:
+        signal = position.signal
+        analysis = signal.analysis if signal is not None else None
+        news = analysis.news_item if analysis is not None else None
+        side = _enum_value(position.side)
+        holding_minutes = round((generated_at - position.opened_at).total_seconds() / 60, 2)
+        fair_probability = (
+            float(signal.fair_probability)
+            if signal is not None and signal.fair_probability is not None
+            else None
+        )
+        entry_edge = (
+            float(signal.edge)
+            if signal is not None and signal.edge is not None
+            else None
+        )
+
+        base = {
+            "position_id": position.id,
+            "trade_id": trade.id if trade is not None else None,
+            "signal_id": position.signal_id,
+            "analysis_id": analysis.id if analysis is not None else None,
+            "news_item_id": analysis.news_item_id if analysis is not None else None,
+            "news_title": news.title if news is not None else None,
+            "news_source": news.source if news is not None else None,
+            "market_id": position.market_id,
+            "market_question": position.market_question,
+            "market_query": analysis.market_query if analysis is not None else None,
+            "side": side,
+            "entry_price": float(position.entry_price),
+            "size_usd": float(position.size_usd),
+            "shares": float(position.shares),
+            "fair_probability": fair_probability,
+            "entry_edge": entry_edge,
+            "opened_at": position.opened_at.isoformat(),
+            "holding_minutes": holding_minutes,
+            "opposite_news_reason": opposite_news_reason,
+        }
+
+        if trade is None:
+            return PaperOpenPositionReportItem(
+                **base,
+                action="SKIPPED",
+                error="open_trade_not_found",
+            )
+
+        if market is None:
+            return PaperOpenPositionReportItem(
+                **base,
+                action="SKIPPED",
+                close_reason="market_snapshot_not_found",
+                error="market_snapshot_not_found",
+            )
+
+        current_price = select_exit_market_price(
+            side=side,
+            yes_price=market.yes_price,
+            no_price=market.no_price,
+            last_trade_price=market.last_trade_price,
+        )
+        market_fields = {
+            "liquidity": market.liquidity,
+            "best_bid": market.best_bid,
+            "best_ask": market.best_ask,
+            "last_trade_price": market.last_trade_price,
+        }
+        if current_price is None:
+            return PaperOpenPositionReportItem(
+                **base,
+                **market_fields,
+                action="SKIPPED",
+                close_reason="market_price_unavailable",
+                error="market_price_unavailable",
+            )
+
+        current_price_delta = round(current_price - float(trade.entry_price), 4)
+        current_edge = calculate_current_edge(
+            fair_probability=fair_probability,
+            current_price=current_price,
+        )
+        edge_delta = (
+            round(current_edge - entry_edge, 4)
+            if current_edge is not None and entry_edge is not None
+            else None
+        )
+        priced_fields = {
+            **market_fields,
+            "current_price": current_price,
+            "current_price_delta": current_price_delta,
+            "current_edge": current_edge,
+            "edge_delta": edge_delta,
+        }
+
+        resolution = resolve_market_resolution(market)
+        if resolution is not None:
+            return PaperOpenPositionReportItem(
+                **base,
+                **priced_fields,
+                action="WOULD_CLOSE",
+                close_reason=f"market_resolved:{resolution.outcome_label}",
+            )
+
+        if opposite_news_reason is not None:
+            return PaperOpenPositionReportItem(
+                **base,
+                **priced_fields,
+                action="WOULD_CLOSE",
+                close_reason=opposite_news_reason,
+            )
+
+        if not self.settings.paper_auto_close_enabled:
+            return PaperOpenPositionReportItem(
+                **base,
+                **priced_fields,
+                action="HELD",
+                close_reason="auto_close_disabled",
+            )
+
+        should_close, close_reason, _ = evaluate_auto_close_case(
+            settings=self.settings,
+            entry_price=float(trade.entry_price),
+            current_price=current_price,
+            holding_minutes=holding_minutes,
+            entry_edge=entry_edge,
+            current_edge=current_edge,
+        )
+        return PaperOpenPositionReportItem(
+            **base,
+            **priced_fields,
+            action="WOULD_CLOSE" if should_close else "HELD",
+            close_reason=close_reason if should_close else "hold_conditions_not_met",
+        )
+
     async def maintain_open_positions(self) -> PaperTradeMaintenanceResult:
         """Apply simple auto-close rules to every open paper position."""
         open_positions = await self.trade_repository.list_open_positions()
@@ -767,6 +1065,19 @@ class PaperTrader:
 
             if resolution is not None:
                 close_reason = f"market_resolved:{resolution.outcome_label}"
+                current_edge = calculate_current_edge(
+                    fair_probability=(
+                        float(position.signal.fair_probability)
+                        if position.signal is not None
+                        else None
+                    ),
+                    current_price=current_price,
+                )
+                entry_edge = (
+                    float(position.signal.edge)
+                    if position.signal is not None and position.signal.edge is not None
+                    else None
+                )
                 close_result = await self.close_position(
                     position_id=position.id,
                     exit_price=current_price,
@@ -786,12 +1097,31 @@ class PaperTrader:
                         close_reason=close_reason,
                         current_price=current_price,
                         current_price_delta=round(current_price - float(trade.entry_price), 4),
+                        current_edge=current_edge,
+                        edge_delta=(
+                            round(current_edge - entry_edge, 4)
+                            if current_edge is not None and entry_edge is not None
+                            else None
+                        ),
                         holding_minutes=holding_minutes,
                     )
                 )
                 continue
 
             if not auto_close_enabled:
+                current_edge = calculate_current_edge(
+                    fair_probability=(
+                        float(position.signal.fair_probability)
+                        if position.signal is not None
+                        else None
+                    ),
+                    current_price=current_price,
+                )
+                entry_edge = (
+                    float(position.signal.edge)
+                    if position.signal is not None and position.signal.edge is not None
+                    else None
+                )
                 decisions.append(
                     PaperTradeAutoCloseDecision(
                         **base_decision,
@@ -800,6 +1130,57 @@ class PaperTrader:
                         close_reason="auto_close_disabled",
                         current_price=current_price,
                         current_price_delta=round(current_price - float(trade.entry_price), 4),
+                        current_edge=current_edge,
+                        edge_delta=(
+                            round(current_edge - entry_edge, 4)
+                            if current_edge is not None and entry_edge is not None
+                            else None
+                        ),
+                        holding_minutes=holding_minutes,
+                    )
+                )
+                continue
+
+            current_edge = calculate_current_edge(
+                fair_probability=(
+                    float(position.signal.fair_probability)
+                    if position.signal is not None
+                    else None
+                ),
+                current_price=current_price,
+            )
+            entry_edge = (
+                float(position.signal.edge)
+                if position.signal is not None and position.signal.edge is not None
+                else None
+            )
+            opposite_news_reason = await self._opposite_news_exit_reason(position=position)
+            if opposite_news_reason is not None:
+                current_price_delta = round(current_price - float(trade.entry_price), 4)
+                edge_delta = (
+                    round(current_edge - entry_edge, 4)
+                    if current_edge is not None and entry_edge is not None
+                    else None
+                )
+                close_result = await self.close_position(
+                    position_id=position.id,
+                    exit_price=current_price,
+                    close_reason=opposite_news_reason,
+                    holding_minutes=holding_minutes,
+                    current_price_delta=current_price_delta,
+                )
+                closed_trade_ids.append(close_result.trade_id)
+                closed_results.append(close_result)
+                decisions.append(
+                    PaperTradeAutoCloseDecision(
+                        **base_decision,
+                        trade_id=close_result.trade_id,
+                        action="CLOSED",
+                        close_reason=opposite_news_reason,
+                        current_price=current_price,
+                        current_price_delta=current_price_delta,
+                        current_edge=current_edge,
+                        edge_delta=edge_delta,
                         holding_minutes=holding_minutes,
                     )
                 )
@@ -810,6 +1191,13 @@ class PaperTrader:
                 entry_price=float(trade.entry_price),
                 current_price=current_price,
                 holding_minutes=holding_minutes,
+                entry_edge=entry_edge,
+                current_edge=current_edge,
+            )
+            edge_delta = (
+                round(current_edge - entry_edge, 4)
+                if current_edge is not None and entry_edge is not None
+                else None
             )
 
             if not should_close:
@@ -821,6 +1209,8 @@ class PaperTrader:
                         close_reason="hold_conditions_not_met",
                         current_price=current_price,
                         current_price_delta=current_price_delta,
+                        current_edge=current_edge,
+                        edge_delta=edge_delta,
                         holding_minutes=holding_minutes,
                     )
                 )
@@ -843,6 +1233,8 @@ class PaperTrader:
                     close_reason=close_reason,
                     current_price=current_price,
                     current_price_delta=current_price_delta,
+                    current_edge=current_edge,
+                    edge_delta=edge_delta,
                     holding_minutes=holding_minutes,
                 )
             )
@@ -861,6 +1253,8 @@ class PaperTrader:
                 close_reason=decision.close_reason,
                 current_price=decision.current_price,
                 current_price_delta=decision.current_price_delta,
+                current_edge=decision.current_edge,
+                edge_delta=decision.edge_delta,
                 holding_minutes=decision.holding_minutes,
                 error=decision.error,
             )
@@ -890,6 +1284,37 @@ class PaperTrader:
             observation_sync_skipped_signals=observation_sync.skipped_signals,
         )
         return result
+
+    async def _opposite_news_exit_reason(self, *, position) -> str | None:
+        if not self.settings.paper_opposite_news_exit_enabled:
+            return None
+        if position.signal is None or position.signal.analysis is None:
+            return None
+
+        since = max(
+            position.opened_at,
+            datetime.now(UTC)
+            - timedelta(minutes=self.settings.paper_opposite_news_lookback_minutes),
+        )
+        analyses = await self.analysis_repository.list_with_context(since=since)
+        position_query = position.signal.analysis.market_query
+
+        for analysis in reversed(analyses):
+            if analysis.id == position.signal.analysis.id:
+                continue
+            should_close, reason = evaluate_opposite_news_exit_case(
+                settings=self.settings,
+                position_side=_enum_value(position.side),
+                position_query=position_query,
+                candidate_direction=_enum_value(analysis.direction),
+                candidate_query=analysis.market_query,
+                candidate_confidence=float(analysis.confidence),
+                candidate_relevance=float(analysis.relevance),
+            )
+            if should_close:
+                return f"{reason},analysis_id={analysis.id}"
+
+        return None
 
     async def sync_resolved_signal_observations(
         self,
@@ -1150,6 +1575,23 @@ async def get_paper_trade_analytics(
     return await trader.get_analytics(days=days)
 
 
+async def get_paper_open_position_report(
+    session: AsyncSession,
+    settings: Settings,
+) -> PaperOpenPositionReport:
+    """Convenience entrypoint to inspect open paper positions without side effects."""
+    trader = PaperTrader(
+        settings=settings,
+        signal_repository=SignalRepository(session),
+        analysis_repository=AnalysisRepository(session),
+        trade_repository=TradeRepository(session),
+        forecast_observation_repository=ForecastObservationRepository(session),
+        runtime_flag_repository=RuntimeFlagRepository(session),
+        market_client=build_market_client(settings),
+    )
+    return await trader.inspect_open_positions()
+
+
 async def run_paper_trade_maintenance(
     session: AsyncSession,
     settings: Settings,
@@ -1196,6 +1638,10 @@ def _parse_args() -> argparse.Namespace:
     subparsers.add_parser(
         "maintain",
         help="Evaluate open paper positions and auto-close the ones that hit exit rules.",
+    )
+    subparsers.add_parser(
+        "positions",
+        help="Show read-only diagnostics for open paper positions.",
     )
     subparsers.add_parser("stats", help="Show paper-trading statistics.")
     analytics_parser = subparsers.add_parser(
@@ -1251,6 +1697,11 @@ async def _main() -> None:
 
         if args.command == "maintain":
             result = await run_paper_trade_maintenance(session, settings)
+            print(result.model_dump_json())
+            return
+
+        if args.command == "positions":
+            result = await get_paper_open_position_report(session, settings)
             print(result.model_dump_json())
             return
 

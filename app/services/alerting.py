@@ -8,6 +8,7 @@ import httpx
 
 from app.config import Settings, get_settings
 from app.logging_utils import configure_logging, log_event
+from app.schemas.anomaly import AnomalyHunterReport
 from app.schemas.daily_report import DailyReport
 from app.schemas.alert import AlertDispatchResult, AlertMessage
 from app.schemas.live_execution import LiveOrderResult
@@ -421,6 +422,55 @@ class AlertingService:
                 "approved_signals_count_24h": report.approved_signals_count_24h,
                 "opened_paper_trades_24h": report.opened_paper_trades_24h,
                 "closed_paper_trades_24h": report.closed_paper_trades_24h,
+            },
+        )
+        return await self._deliver(alert)
+
+    async def send_anomaly_hunter_report(
+        self,
+        *,
+        report: AnomalyHunterReport,
+    ) -> AlertDispatchResult:
+        if not self.settings.alert_on_daily_report:
+            return self._skipped_result("anomaly_hunter_report_alert", "alert_on_daily_report=false")
+
+        top_lines = []
+        for item in report.top_hypotheses[:5]:
+            top_lines.append(
+                (
+                    f"- <code>{item.score:.1f}</code> "
+                    f"{html.escape(item.hypothesis_type)}: "
+                    f"{html.escape(item.title)}"
+                )
+            )
+        if not top_lines:
+            top_lines = ["- none"]
+        note_lines = [f"- {html.escape(note)}" for note in report.notes] if report.notes else ["- none"]
+
+        alert = AlertMessage(
+            event="anomaly_hunter_report_alert",
+            level="INFO",
+            title="Anomaly Hunter Report",
+            text="\n".join(
+                [
+                    "<b>Anomaly Hunter Report</b>",
+                    f"generated_at=<code>{html.escape(report.generated_at)}</code>",
+                    f"window_hours=<code>{report.window_hours}</code>",
+                    f"observations=<code>{report.observations_count}</code>",
+                    f"hypotheses=<code>{report.hypotheses_count}</code>",
+                    "",
+                    "<b>Top hypotheses</b>",
+                    *top_lines,
+                    "",
+                    "<b>Notes</b>",
+                    *note_lines,
+                ]
+            ),
+            context={
+                "generated_at": report.generated_at,
+                "window_hours": report.window_hours,
+                "observations_count": report.observations_count,
+                "hypotheses_count": report.hypotheses_count,
             },
         )
         return await self._deliver(alert)
