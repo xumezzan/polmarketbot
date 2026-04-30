@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     live_max_trade_size_usd: float = 5.0
     live_min_trade_size_usd: float = 2.0
     live_max_daily_exposure_usd: float = 25.0
+    live_daily_loss_limit_usd: float = 25.0
     live_max_open_positions: int = 1
     live_order_type: str = "FOK"
     live_price_buffer_bps: float = 50.0

@@ -6,6 +6,7 @@ import pytest
 from app.models.enums import ExecutionIntentStatus, LiveOrderStatus, MarketSide, VerdictDirection
 from app.schemas.market import GammaMarket
 from app.services.live_execution import (
+    CircuitBreakerTriggeredError,
     LiveExecutionService,
     LiveTradingDisabledError,
     StubCLOBClient,
@@ -38,6 +39,10 @@ class FakeRuntimeFlagRepository:
 
     async def get_bool(self, *, key: str, default: bool = False) -> bool:
         return self.flags.get(key, default)
+
+    async def set_bool(self, *, key: str, value: bool):
+        self.flags[key] = value
+        return SimpleNamespace(key=key, bool_value=value, updated_at=datetime.now(UTC))
 
 
 class FakeExecutionIntentRepository:
@@ -121,13 +126,13 @@ def _build_signal():
     )
 
 
-def _build_market() -> GammaMarket:
+def _build_market(*, yes_price: float = 0.62, no_price: float = 0.38) -> GammaMarket:
     return GammaMarket.model_validate(
         {
             "id": "mkt-btc-1",
             "question": "Will BTC hit 150k?",
             "outcomes": ["Yes", "No"],
-            "outcomePrices": ["0.62", "0.38"],
+            "outcomePrices": [str(yes_price), str(no_price)],
             "clobTokenIds": ["yes-token", "no-token"],
             "bestBid": 0.61,
             "bestAsk": 0.63,
@@ -137,14 +142,14 @@ def _build_market() -> GammaMarket:
     )
 
 
-def _build_service(*, settings=None, live_repo=None):
+def _build_service(*, settings=None, live_repo=None, market=None, runtime_repo=None):
     signal = _build_signal()
-    market = _build_market()
+    market = market or _build_market()
     return LiveExecutionService(
         settings=settings or build_test_settings(execution_mode="shadow"),
         signal_repository=FakeSignalRepository(signal),
         analysis_repository=FakeAnalysisRepository(),
-        runtime_flag_repository=FakeRuntimeFlagRepository(),
+        runtime_flag_repository=runtime_repo or FakeRuntimeFlagRepository(),
         execution_intent_repository=FakeExecutionIntentRepository(),
         live_trade_repository=live_repo or FakeLiveTradeRepository(),
         market_client=FakeMarketClient(market),
@@ -202,6 +207,41 @@ async def test_live_execution_creates_order_and_position() -> None:
     assert result.order_status == LiveOrderStatus.FILLED.value
     assert result.live_order_id == 1
     assert result.live_position_id == 1
+
+
+@pytest.mark.asyncio
+async def test_live_execution_triggers_circuit_breaker_at_daily_loss_limit() -> None:
+    live_repo = FakeLiveTradeRepository()
+    live_repo.positions.append(
+        SimpleNamespace(
+            id=1,
+            market_id="mkt-btc-1",
+            side=MarketSide.YES,
+            entry_price=0.50,
+            shares=100.0,
+        )
+    )
+    runtime_repo = FakeRuntimeFlagRepository()
+    service = _build_service(
+        settings=build_test_settings(
+            execution_mode="live",
+            live_trading_enabled=True,
+            live_min_trade_size_usd=2.0,
+            live_max_trade_size_usd=5.0,
+            live_max_daily_exposure_usd=25.0,
+            live_daily_loss_limit_usd=25.0,
+            live_max_open_positions=3,
+        ),
+        live_repo=live_repo,
+        market=_build_market(yes_price=0.25, no_price=0.75),
+        runtime_repo=runtime_repo,
+    )
+
+    with pytest.raises(CircuitBreakerTriggeredError) as exc_info:
+        await service.place_order(signal_id=101, approved_size_usd=3.0)
+
+    assert "live_daily_loss_limit_reached:-25.00<=-25.00" in str(exc_info.value)
+    assert runtime_repo.flags["live_circuit_breaker"] is True
 
 
 @pytest.mark.asyncio

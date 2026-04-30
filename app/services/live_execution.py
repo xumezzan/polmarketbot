@@ -253,6 +253,22 @@ def _select_requested_price(signal, market, *, side: MarketSide) -> float:
     raise LiveExecutionError(f"Signal {signal.id} has no executable price")
 
 
+def _select_position_mark_price(market, *, side: MarketSide) -> float | None:
+    if side == MarketSide.YES:
+        if market.yes_price is not None:
+            return round(float(market.yes_price), 4)
+        if market.best_bid is not None:
+            return round(float(market.best_bid), 4)
+    if side == MarketSide.NO:
+        if market.no_price is not None:
+            return round(float(market.no_price), 4)
+        if market.yes_price is not None:
+            return round(1.0 - float(market.yes_price), 4)
+    if market.last_trade_price is not None:
+        return round(float(market.last_trade_price), 4)
+    return None
+
+
 def _build_client_order_id(
     *,
     signal_id: int,
@@ -637,6 +653,8 @@ class LiveExecutionService:
         if breaker_enabled:
             raise CircuitBreakerTriggeredError("live_circuit_breaker=true")
 
+        await self._assert_live_loss_limit_not_breached()
+
         if approved_size_usd < self.settings.live_min_trade_size_usd:
             raise LiveExecutionError(
                 f"approved_size_usd={approved_size_usd:.2f} below "
@@ -664,6 +682,39 @@ class LiveExecutionService:
                 f"daily_exposure={daily_exposure + approved_size_usd:.2f} exceeds "
                 f"LIVE_MAX_DAILY_EXPOSURE_USD={self.settings.live_max_daily_exposure_usd:.2f}"
             )
+
+    async def _assert_live_loss_limit_not_breached(self) -> None:
+        loss_limit = float(self.settings.live_daily_loss_limit_usd)
+        if loss_limit <= 0:
+            return
+
+        unrealized_pnl = await self._estimate_open_live_positions_pnl()
+        if unrealized_pnl <= -loss_limit:
+            await self.runtime_flag_repository.set_bool(
+                key=RUNTIME_FLAG_LIVE_CIRCUIT_BREAKER,
+                value=True,
+            )
+            raise CircuitBreakerTriggeredError(
+                f"live_daily_loss_limit_reached:{unrealized_pnl:.2f}<=-{loss_limit:.2f}"
+            )
+
+    async def _estimate_open_live_positions_pnl(self) -> float:
+        total_pnl = 0.0
+        open_positions = await self.live_trade_repository.list_open_positions()
+        for position in open_positions:
+            market = await self.market_client.fetch_market(position.market_id)
+            if market is None:
+                raise LiveExecutionError(
+                    f"Cannot evaluate live loss limit: market {position.market_id} not found"
+                )
+            current_price = _select_position_mark_price(market, side=position.side)
+            if current_price is None:
+                raise LiveExecutionError(
+                    "Cannot evaluate live loss limit: "
+                    f"market {position.market_id} has no {position.side.value} price"
+                )
+            total_pnl += (float(current_price) - float(position.entry_price)) * float(position.shares)
+        return round(total_pnl, 4)
 
     def _extract_exchange_order_id(self, response: dict[str, object]) -> str | None:
         for key in ("orderID", "id", "order_id"):
