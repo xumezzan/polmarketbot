@@ -21,6 +21,11 @@ from app.services.forecasting import (
     build_execution_edge,
     calibrate_probability,
 )
+from app.services.strategy_filters import (
+    extract_verdict_strategy_metadata,
+    has_direct_market_event_match,
+    parse_csv_setting,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -285,6 +290,8 @@ class SignalEngine:
         relevance = float(analysis.relevance)
         confidence = float(analysis.confidence)
         direction = analysis.direction
+        strategy_metadata = extract_verdict_strategy_metadata(analysis.raw_response)
+        causality_score = strategy_metadata.causality_score
 
         if direction == VerdictDirection.NONE:
             return (
@@ -293,6 +300,56 @@ class SignalEngine:
                     f"Rejected because direction=NONE. raw_probability={raw_probability:.4f}, "
                     f"calibrated_probability={fair_probability:.4f}, "
                     f"reference_market_price={market_price:.4f}, net_edge={edge:.4f}."
+                ),
+            )
+
+        if causality_score < self.settings.risk_min_causality_score:
+            return (
+                SignalStatus.REJECTED,
+                (
+                    f"Rejected because causality is weak: "
+                    f"causality_score={causality_score:.4f}<"
+                    f"{self.settings.risk_min_causality_score:.4f}. "
+                    f"net_edge={edge:.4f}, confidence={confidence:.4f}, "
+                    f"relevance={relevance:.4f}, market_price={market_price:.4f}."
+                ),
+            )
+
+        allowed_categories = parse_csv_setting(self.settings.risk_allowed_event_categories)
+        if strategy_metadata.event_category not in allowed_categories:
+            return (
+                SignalStatus.REJECTED,
+                (
+                    f"Rejected because event category is not whitelisted: "
+                    f"{strategy_metadata.event_category}. allowed={','.join(sorted(allowed_categories))}. "
+                    f"net_edge={edge:.4f}, confidence={confidence:.4f}, relevance={relevance:.4f}."
+                ),
+            )
+
+        allowed_qualities = parse_csv_setting(self.settings.risk_allowed_news_qualities)
+        if strategy_metadata.news_quality not in allowed_qualities:
+            return (
+                SignalStatus.REJECTED,
+                (
+                    f"Rejected because news quality is too weak: "
+                    f"{strategy_metadata.news_quality}. allowed={','.join(sorted(allowed_qualities))}. "
+                    f"net_edge={edge:.4f}, confidence={confidence:.4f}, relevance={relevance:.4f}."
+                ),
+            )
+
+        if (
+            self.settings.risk_require_direct_market_event_match
+            and not has_direct_market_event_match(
+                query_text=analysis.market_query,
+                market_question=candidate.question,
+            )
+        ):
+            return (
+                SignalStatus.REJECTED,
+                (
+                    "Rejected because news query and market question do not describe the same "
+                    f"event. query={analysis.market_query!r}, market={candidate.question!r}, "
+                    f"net_edge={edge:.4f}, match_score={candidate.match_score:.4f}."
                 ),
             )
 
@@ -320,6 +377,7 @@ class SignalEngine:
                     f"Actionable: net_edge={edge:.4f} exceeds "
                     f"{self.settings.signal_actionable_edge_threshold:.4f}, "
                     f"confidence={confidence:.4f}, relevance={relevance:.4f}, "
+                    f"causality_score={causality_score:.4f}, "
                     f"market_price={market_price:.4f}, execution_price={execution_price:.4f}, "
                     f"raw_probability={raw_probability:.4f}, "
                     f"calibrated_probability={fair_probability:.4f}, "

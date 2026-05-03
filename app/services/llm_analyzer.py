@@ -42,6 +42,7 @@ from app.repositories.news_repo import NewsRepository
 from app.schemas.verdict import AnalysisRunResult, Verdict
 from app.services.forecasting import estimate_openai_cost_usd
 from app.services.retry_utils import retry_async
+from app.services.strategy_filters import parse_csv_setting
 
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,9 @@ class StubLLMClient:
             verdict = Verdict(
                 relevance=0.88,
                 confidence=0.82,
+                causality_score=0.20,
+                event_category="OTHER",
+                news_quality="LOW",
                 direction="YES",
                 fair_probability=0.64,
                 market_query="bitcoin 1m gta vi",
@@ -218,6 +222,9 @@ class StubLLMClient:
             verdict = Verdict(
                 relevance=0.90,
                 confidence=0.84,
+                causality_score=0.25,
+                event_category="OTHER",
+                news_quality="LOW",
                 direction="YES",
                 fair_probability=0.69,
                 market_query="bitcoin 150k june 2026",
@@ -230,6 +237,9 @@ class StubLLMClient:
             verdict = Verdict(
                 relevance=0.62,
                 confidence=0.66,
+                causality_score=0.10,
+                event_category="OTHER",
+                news_quality="LOW",
                 direction="NONE",
                 fair_probability=0.50,
                 market_query="bitcoin 150k june 2026",
@@ -242,6 +252,9 @@ class StubLLMClient:
             verdict = Verdict(
                 relevance=0.61,
                 confidence=0.70,
+                causality_score=0.20,
+                event_category="OTHER",
+                news_quality="LOW",
                 direction="NONE",
                 fair_probability=0.50,
                 market_query="fed rate cuts 2026",
@@ -254,6 +267,9 @@ class StubLLMClient:
             verdict = Verdict(
                 relevance=0.55,
                 confidence=0.60,
+                causality_score=0.10,
+                event_category="OTHER",
+                news_quality="LOW",
                 direction="NONE",
                 fair_probability=0.50,
                 market_query="bitcoin 150k june 2026",
@@ -266,6 +282,9 @@ class StubLLMClient:
             verdict = Verdict(
                 relevance=0.56,
                 confidence=0.64,
+                causality_score=0.20,
+                event_category="OTHER",
+                news_quality="LOW",
                 direction="NONE",
                 fair_probability=0.50,
                 market_query="fed rate cuts 2026",
@@ -278,6 +297,9 @@ class StubLLMClient:
             verdict = Verdict(
                 relevance=0.35,
                 confidence=0.40,
+                causality_score=0.0,
+                event_category="OTHER",
+                news_quality="LOW",
                 direction="NONE",
                 fair_probability=0.50,
                 market_query="general news",
@@ -380,6 +402,29 @@ def resolve_market_pipeline_skip_reason(
     if verdict.direction == "NONE":
         return "neutral_verdict"
 
+    if verdict.causality_score < settings.risk_min_causality_score:
+        return (
+            "causality_score_below_threshold:"
+            f"{verdict.causality_score:.4f}<"
+            f"{settings.risk_min_causality_score:.4f}"
+        )
+
+    allowed_categories = parse_csv_setting(settings.risk_allowed_event_categories)
+    event_category = verdict.event_category.upper()
+    if event_category not in allowed_categories:
+        return (
+            "event_category_not_allowed:"
+            f"{event_category} not in {','.join(sorted(allowed_categories))}"
+        )
+
+    allowed_qualities = parse_csv_setting(settings.risk_allowed_news_qualities)
+    news_quality = verdict.news_quality.upper()
+    if news_quality not in allowed_qualities:
+        return (
+            "news_quality_not_allowed:"
+            f"{news_quality} not in {','.join(sorted(allowed_qualities))}"
+        )
+
     if not scores:
         return None
 
@@ -446,8 +491,8 @@ class OpenAILLMClient:
                             "You analyze news for a Polymarket paper-trading bot. "
                             "Return only a structured verdict that follows the schema. "
                             "LLM is an advisor, not the final decision-maker. "
-                            "Use an aggressive catalyst-seeking style, but do not invent facts. "
-                            "If the article is weak or ambiguous, use "
+                            "Use a strict direct-catalyst style and do not invent facts. "
+                            "If the news does not cause an immediate probability change, use "
                             "direction=NONE and fair_probability near 0.50."
                         ),
                     },
@@ -515,28 +560,37 @@ class OpenAILLMClient:
 
         return (
             "Analyze the following news item for a Polymarket news trading bot.\n\n"
-            "Prefer a directional YES/NO verdict when the news is fresh, high-attention, "
-            "and maps to a concrete, currently plausible binary prediction market. "
-            "Treat approvals, filings, bans, court rulings, exchange/product launches, "
-            "ETF flows, hacks, sanctions, tariffs, resignations, ceasefire headlines, "
-            "major company/person actions, and sharp crypto/macro catalysts as tradable "
-            "signals when they have a clear market side. Prefer specific market_query "
-            "phrases that include the entity, measurable outcome, and timeframe when known "
-            "(for example: 'bitcoin 150k june 2026', 'fed rate cuts 2026', "
-            "'trump crypto tax 2027').\n\n"
+            "Only return YES or NO when the item is breaking news or a confirmed, direct "
+            "catalyst for a specific market in the next 3 hours. The market must be "
+            "specifically about the event in the news, not just the same broad topic or person. Examples: "
+            "Biden health news may map to a Biden health market, not a Democrats 2028 "
+            "market. A Trump court ruling may map to a Trump conviction/court market, "
+            "not a Trump election market.\n\n"
+            "Allowed event_category values are ELECTION, COURT_DECISION, POLITICIAN_HEALTH, "
+            "WAR_CONFLICT, OTHER. Prefer YES/NO only for elections, court decisions, "
+            "politician health, and wars/conflicts. Set news_quality to CONFIRMED_EVENT "
+            "or OFFICIAL_STATEMENT only for confirmed facts or official statements. Use "
+            "LOW for opinion, analysis, speculation, 'may/could/might' articles, broad "
+            "market commentary, thought leadership, or price movement without a confirmed "
+            "event.\n\n"
             "Use direction=NONE, fair_probability=0.50, and a low confidence when the article "
-            "is broad industry commentary, conference/speaker news, product thought leadership, "
-            "vague AI/crypto impact, or price movement without a clear market catalyst. "
-            "Do not suppress a verdict merely because evidence is early; encode uncertainty "
-            "in confidence and fair_probability while still choosing YES/NO when there is "
-            "a concrete market and directional catalyst. For direction=NONE, market_query "
+            "is opinion, analysis, speculation, broad industry commentary, conference/speaker "
+            "news, product thought leadership, vague AI/crypto impact, or price movement "
+            "without a confirmed market catalyst. If the news does not directly and obviously "
+            "change the probability of the chosen market in the next 3 hours, return NONE. "
+            "For direction=NONE, market_query "
             "should be either a concrete market to monitor or 'general news'; do not use vague queries like "
             "'crypto impact', 'AI agents in crypto payments', or 'crypto security AI impact'.\n\n"
-            "Do not infer a trade only from general sentiment. A good verdict should answer: "
-            "which binary market would this affect, which side, and why now?\n\n"
+            "Do not infer a trade only from general sentiment. Never choose a market if the "
+            "link is not direct and obvious. A good verdict should answer: which exact "
+            "binary market would this event affect, which side, and why now?\n\n"
             "Return a verdict with these meanings:\n"
             "- relevance: how relevant this news is for prediction markets, 0 to 1\n"
             "- confidence: how confident you are in your interpretation, 0 to 1\n"
+            "- causality_score: answer this question from 0 to 1: 'Will this news directly "
+            "change the probability of the selected market in the next 3 hours?'\n"
+            "- event_category: ELECTION, COURT_DECISION, POLITICIAN_HEALTH, WAR_CONFLICT, or OTHER\n"
+            "- news_quality: CONFIRMED_EVENT, OFFICIAL_STATEMENT, or LOW\n"
             "- direction: YES, NO, or NONE\n"
             "- fair_probability: estimated fair probability for the best matching binary market, 0 to 1\n"
             "- market_query: short search query to find the matching Polymarket market\n"
@@ -820,6 +874,21 @@ class LLMAnalyzerService:
         return Verdict(
             relevance=float(analysis.relevance),
             confidence=float(analysis.confidence),
+            causality_score=float(
+                (analysis.raw_response or {}).get("verdict", {}).get("causality_score", 0.0)
+                if isinstance((analysis.raw_response or {}).get("verdict"), dict)
+                else 0.0
+            ),
+            event_category=str(
+                (analysis.raw_response or {}).get("verdict", {}).get("event_category", "OTHER")
+                if isinstance((analysis.raw_response or {}).get("verdict"), dict)
+                else "OTHER"
+            ),
+            news_quality=str(
+                (analysis.raw_response or {}).get("verdict", {}).get("news_quality", "LOW")
+                if isinstance((analysis.raw_response or {}).get("verdict"), dict)
+                else "LOW"
+            ),
             direction=analysis.direction.value,
             fair_probability=float(analysis.fair_probability),
             market_query=analysis.market_query,

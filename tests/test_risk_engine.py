@@ -26,7 +26,7 @@ def test_risk_engine_allows_clean_actionable_signal() -> None:
 
 
 def test_risk_engine_blocks_stale_duplicate_and_daily_limit() -> None:
-    settings = build_test_settings()
+    settings = build_test_settings(risk_max_news_age_minutes=360)
 
     result = evaluate_risk_case(
         settings=settings,
@@ -190,6 +190,84 @@ def test_risk_engine_blocks_weak_market_match() -> None:
     assert result.allow is False
     assert "match_score_too_low:0.2400<0.3500" in result.blockers
     assert result.approved_size_usd == 0.0
+
+
+def test_risk_engine_blocks_low_causality_and_non_whitelisted_news() -> None:
+    settings = build_test_settings()
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        causality_score=0.30,
+        event_category="OTHER",
+        news_quality="LOW",
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.10,
+        match_score=0.55,
+        existing_open_position=False,
+        daily_exposure_used_usd=0.0,
+        query_text="Trump tariffs analysis",
+        market_question="Will Trump win the 2028 election?",
+    )
+
+    assert result.allow is False
+    assert "causality_below_threshold:0.3000<0.7000" in result.blockers
+    assert "event_category_not_allowed:OTHER not in COURT_DECISION,ELECTION,POLITICIAN_HEALTH,WAR_CONFLICT" in result.blockers
+    assert "news_quality_not_allowed:LOW not in CONFIRMED_EVENT,OFFICIAL_STATEMENT" in result.blockers
+
+
+def test_risk_engine_blocks_indirect_market_event_match() -> None:
+    settings = build_test_settings()
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        causality_score=0.90,
+        event_category="COURT_DECISION",
+        news_quality="CONFIRMED_EVENT",
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.10,
+        match_score=0.55,
+        existing_open_position=False,
+        daily_exposure_used_usd=0.0,
+        query_text="Trump court conviction",
+        market_question="Will Trump win the 2028 election?",
+    )
+
+    assert result.allow is False
+    assert "direct_market_event_match_missing" in result.blockers
+
+
+def test_risk_engine_blocks_after_two_trades_per_day() -> None:
+    settings = build_test_settings(risk_max_trades_per_day=2)
+
+    result = evaluate_risk_case(
+        settings=settings,
+        signal_status="ACTIONABLE",
+        confidence=0.79,
+        relevance=0.86,
+        causality_score=0.90,
+        event_category="ELECTION",
+        news_quality="CONFIRMED_EVENT",
+        news_age_minutes=30,
+        liquidity=200000.0,
+        edge=0.10,
+        match_score=0.55,
+        existing_open_position=False,
+        daily_exposure_used_usd=0.0,
+        daily_trade_count=2,
+        query_text="Senate election winner",
+        market_question="Will Republicans win the Senate election?",
+    )
+
+    assert result.allow is False
+    assert "daily_trade_count_limit_reached:2>=2" in result.blockers
 
 
 def test_risk_engine_allows_meaningful_query_market_overlap_for_short_queries() -> None:

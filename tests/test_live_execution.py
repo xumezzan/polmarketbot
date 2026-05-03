@@ -3,10 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 
+import app.services.live_execution as live_execution_module
 from app.models.enums import ExecutionIntentStatus, LiveOrderStatus, MarketSide, VerdictDirection
 from app.schemas.market import GammaMarket
 from app.services.live_execution import (
     CircuitBreakerTriggeredError,
+    LiveEdgeGateBlockedError,
     LiveExecutionService,
     LiveTradingDisabledError,
     StubCLOBClient,
@@ -104,6 +106,26 @@ class FakeLiveTradeRepository:
         return self.positions
 
 
+class FakeTradeRepository:
+    def __init__(self, *, win_rate: float = 0.60) -> None:
+        self.win_rate = win_rate
+
+    async def get_trade_statistics(self):
+        return {
+            "total_trades": 10,
+            "closed_trades": 10,
+            "open_positions": 0,
+            "winning_trades": int(self.win_rate * 10),
+            "losing_trades": int((1 - self.win_rate) * 10),
+            "win_rate": self.win_rate,
+            "total_pnl": 10.0,
+        }
+
+
+class FakeSchedulerCycleRepository:
+    pass
+
+
 class FakeMarketClient:
     def __init__(self, market: GammaMarket) -> None:
         self.market = market
@@ -142,7 +164,7 @@ def _build_market(*, yes_price: float = 0.62, no_price: float = 0.38) -> GammaMa
     )
 
 
-def _build_service(*, settings=None, live_repo=None, market=None, runtime_repo=None):
+def _build_service(*, settings=None, live_repo=None, market=None, runtime_repo=None, trade_repo=None):
     signal = _build_signal()
     market = market or _build_market()
     return LiveExecutionService(
@@ -152,6 +174,8 @@ def _build_service(*, settings=None, live_repo=None, market=None, runtime_repo=N
         runtime_flag_repository=runtime_repo or FakeRuntimeFlagRepository(),
         execution_intent_repository=FakeExecutionIntentRepository(),
         live_trade_repository=live_repo or FakeLiveTradeRepository(),
+        trade_repository=trade_repo or FakeTradeRepository(),
+        scheduler_cycle_repository=FakeSchedulerCycleRepository(),
         market_client=FakeMarketClient(market),
         clob_client=StubCLOBClient(),
     )
@@ -198,6 +222,7 @@ async def test_live_execution_creates_order_and_position() -> None:
             live_max_trade_size_usd=5.0,
             live_max_daily_exposure_usd=25.0,
             live_max_open_positions=1,
+            live_require_phase_gate_passed=False,
         )
     )
 
@@ -207,6 +232,52 @@ async def test_live_execution_creates_order_and_position() -> None:
     assert result.order_status == LiveOrderStatus.FILLED.value
     assert result.live_order_id == 1
     assert result.live_position_id == 1
+
+
+@pytest.mark.asyncio
+async def test_live_execution_blocks_when_paper_win_rate_below_live_minimum() -> None:
+    service = _build_service(
+        settings=build_test_settings(
+            execution_mode="live",
+            live_trading_enabled=True,
+            live_min_paper_win_rate=0.40,
+        ),
+        trade_repo=FakeTradeRepository(win_rate=0.20),
+    )
+
+    with pytest.raises(LiveEdgeGateBlockedError) as exc_info:
+        await service.place_order(signal_id=101, approved_size_usd=3.0)
+
+    assert "paper_win_rate_below_live_min:0.2000<0.4000" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_live_execution_blocks_when_phase_gate_is_hold(monkeypatch) -> None:
+    class FakeProofOfEdgeService:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def build_phase_gate_report(self, **kwargs):
+            return SimpleNamespace(
+                verdict="HOLD",
+                reasons=["need_more_closed_trades:25<30"],
+            )
+
+    monkeypatch.setattr(live_execution_module, "ProofOfEdgeService", FakeProofOfEdgeService)
+    service = _build_service(
+        settings=build_test_settings(
+            execution_mode="live",
+            live_trading_enabled=True,
+            live_min_paper_win_rate=0.40,
+            live_require_phase_gate_passed=True,
+        ),
+        trade_repo=FakeTradeRepository(win_rate=0.60),
+    )
+
+    with pytest.raises(LiveEdgeGateBlockedError) as exc_info:
+        await service.place_order(signal_id=101, approved_size_usd=3.0)
+
+    assert "paper_phase_gate_not_passed:HOLD" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -231,6 +302,7 @@ async def test_live_execution_triggers_circuit_breaker_at_daily_loss_limit() -> 
             live_max_daily_exposure_usd=25.0,
             live_daily_loss_limit_usd=25.0,
             live_max_open_positions=3,
+            live_require_phase_gate_passed=False,
         ),
         live_repo=live_repo,
         market=_build_market(yes_price=0.25, no_price=0.75),
@@ -254,7 +326,11 @@ async def test_reconcile_open_orders_detects_mismatch() -> None:
         )
     )
     service = _build_service(
-        settings=build_test_settings(execution_mode="live", live_trading_enabled=True),
+        settings=build_test_settings(
+            execution_mode="live",
+            live_trading_enabled=True,
+            live_require_phase_gate_passed=False,
+        ),
         live_repo=live_repo,
     )
 

@@ -16,6 +16,11 @@ from app.repositories.signal_repo import SignalRepository
 from app.repositories.trade_repo import TradeRepository
 from app.schemas.market import MarketCandidate
 from app.schemas.risk import RiskCheckResult, RiskDecision
+from app.services.strategy_filters import (
+    extract_verdict_strategy_metadata,
+    has_direct_market_event_match,
+    parse_csv_setting,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -101,6 +106,9 @@ class RiskEngine:
         daily_exposure_used = await self.trade_repository.get_daily_exposure_used_usd(
             day_start=day_start
         )
+        daily_trade_count = await self.trade_repository.count_opened_trades_since(
+            since=day_start
+        )
         has_existing_position = await self.trade_repository.has_open_position_for_market(
             market_id=signal.market_id
         )
@@ -146,12 +154,16 @@ class RiskEngine:
             reference_market_price=float(signal.market_price),
             best_ask=candidate.best_ask,
         )
+        strategy_metadata = extract_verdict_strategy_metadata(analysis.raw_response)
 
         risk_result = evaluate_risk_case(
             settings=self.settings,
             signal_status=signal.signal_status.value,
             confidence=float(analysis.confidence),
             relevance=float(analysis.relevance),
+            causality_score=strategy_metadata.causality_score,
+            event_category=strategy_metadata.event_category,
+            news_quality=strategy_metadata.news_quality,
             news_age_minutes=news_age_minutes,
             liquidity=liquidity,
             edge=float(signal.edge),
@@ -167,6 +179,7 @@ class RiskEngine:
             yes_entry_slippage=yes_entry_slippage,
             analysis_trade_count=analysis_trade_count,
             daily_exposure_used_usd=daily_exposure_used,
+            daily_trade_count=daily_trade_count,
             top_candidate_score_delta=top_candidate_score_delta,
         )
 
@@ -204,6 +217,12 @@ class RiskEngine:
             checks={
                 "confidence": float(analysis.confidence),
                 "relevance": float(analysis.relevance),
+                "causality_score": strategy_metadata.causality_score,
+                "min_causality_score": self.settings.risk_min_causality_score,
+                "event_category": strategy_metadata.event_category,
+                "allowed_event_categories": self.settings.risk_allowed_event_categories,
+                "news_quality": strategy_metadata.news_quality,
+                "allowed_news_qualities": self.settings.risk_allowed_news_qualities,
                 "news_age_minutes": news_age_minutes,
                 "base_news_age_limit_minutes": self.settings.risk_max_news_age_minutes,
                 "effective_news_age_limit_minutes": effective_news_age_limit_minutes,
@@ -231,6 +250,8 @@ class RiskEngine:
                 "yes_entry_slippage": yes_entry_slippage,
                 "max_yes_entry_slippage": self.settings.risk_max_yes_entry_slippage,
                 "daily_exposure_used_usd": round(daily_exposure_used, 2),
+                "daily_trade_count": daily_trade_count,
+                "max_trades_per_day": self.settings.risk_max_trades_per_day,
                 "existing_open_position": has_existing_position,
                 "duplicate_position_allowed": duplicate_position_allowed,
                 "duplicate_best_existing_edge": duplicate_best_existing_edge,
@@ -504,6 +525,9 @@ def evaluate_risk_case(
     signal_status: str,
     confidence: float,
     relevance: float,
+    causality_score: float = 1.0,
+    event_category: str = "ELECTION",
+    news_quality: str = "CONFIRMED_EVENT",
     news_age_minutes: int,
     liquidity: float,
     edge: float,
@@ -515,6 +539,7 @@ def evaluate_risk_case(
     bid_ask_spread: float | None = None,
     yes_entry_slippage: float | None = None,
     daily_exposure_used_usd: float,
+    daily_trade_count: int = 0,
     analysis_trade_count: int = 0,
     top_candidate_score_delta: float | None = None,
     query_text: str = "",
@@ -544,6 +569,28 @@ def evaluate_risk_case(
             f"relevance_below_threshold:{relevance:.4f}<{settings.risk_min_relevance:.4f}"
         )
 
+    if causality_score < settings.risk_min_causality_score:
+        blockers.append(
+            "causality_below_threshold:"
+            f"{causality_score:.4f}<{settings.risk_min_causality_score:.4f}"
+        )
+
+    allowed_categories = parse_csv_setting(settings.risk_allowed_event_categories)
+    normalized_category = event_category.upper()
+    if normalized_category not in allowed_categories:
+        blockers.append(
+            "event_category_not_allowed:"
+            f"{normalized_category} not in {','.join(sorted(allowed_categories))}"
+        )
+
+    allowed_qualities = parse_csv_setting(settings.risk_allowed_news_qualities)
+    normalized_quality = news_quality.upper()
+    if normalized_quality not in allowed_qualities:
+        blockers.append(
+            "news_quality_not_allowed:"
+            f"{normalized_quality} not in {','.join(sorted(allowed_qualities))}"
+        )
+
     if news_age_minutes > effective_news_age_limit_minutes:
         blockers.append(
             f"news_too_old:{news_age_minutes}>{effective_news_age_limit_minutes}"
@@ -563,6 +610,17 @@ def evaluate_risk_case(
         blockers.append(
             f"match_score_too_low:{match_score:.4f}<{settings.risk_min_match_score:.4f}"
         )
+
+    if (
+        settings.risk_require_direct_market_event_match
+        and query_text.strip()
+        and market_question.strip()
+        and not has_direct_market_event_match(
+            query_text=query_text,
+            market_question=market_question,
+        )
+    ):
+        blockers.append("direct_market_event_match_missing")
 
     if (
         bid_ask_spread is not None
@@ -655,6 +713,12 @@ def evaluate_risk_case(
         blockers.append(
             "daily_limit_reached:"
             f"{daily_exposure_used_usd:.2f}>={settings.risk_max_daily_exposure_usd:.2f}"
+        )
+
+    if daily_trade_count >= settings.risk_max_trades_per_day:
+        blockers.append(
+            "daily_trade_count_limit_reached:"
+            f"{daily_trade_count}>={settings.risk_max_trades_per_day}"
         )
 
     allow = not blockers

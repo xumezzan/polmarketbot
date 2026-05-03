@@ -110,8 +110,10 @@ def test_openai_prompt_discourages_vague_crypto_queries() -> None:
 
     prompt = client._build_user_prompt(news_item)
 
-    assert "concrete, currently plausible binary prediction market" in prompt
-    assert "crypto security AI impact" in prompt
+    assert "confirmed, direct catalyst" in prompt
+    assert "next 3 hours" in prompt
+    assert "directly and obviously" in prompt
+    assert "causality_score" in prompt
     assert "Do not infer a trade only from general sentiment" in prompt
 
 
@@ -119,6 +121,9 @@ def test_market_readiness_scores_concrete_directional_queries() -> None:
     verdict = Verdict(
         relevance=0.78,
         confidence=0.74,
+        causality_score=0.82,
+        event_category="COURT_DECISION",
+        news_quality="CONFIRMED_EVENT",
         direction="YES",
         fair_probability=0.66,
         market_query="canada crypto atm ban 2026",
@@ -147,6 +152,9 @@ def test_market_readiness_skips_generic_directional_queries() -> None:
     verdict = Verdict(
         relevance=0.62,
         confidence=0.58,
+        causality_score=0.20,
+        event_category="OTHER",
+        news_quality="LOW",
         direction="YES",
         fair_probability=0.57,
         market_query="general news",
@@ -165,5 +173,5 @@ def test_market_readiness_skips_generic_directional_queries() -> None:
             verdict=verdict,
             scores=scores,
         )
-        == "tradability_score_below_threshold:0.2500<0.3500"
+        == "causality_score_below_threshold:0.2000<0.7000"
     )

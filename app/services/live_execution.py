@@ -17,7 +17,9 @@ from app.repositories.analysis_repo import AnalysisRepository
 from app.repositories.execution_intent_repo import ExecutionIntentRepository
 from app.repositories.live_trade_repo import LiveTradeRepository
 from app.repositories.runtime_flag_repo import RuntimeFlagRepository
+from app.repositories.scheduler_cycle_repo import SchedulerCycleRepository
 from app.repositories.signal_repo import SignalRepository
+from app.repositories.trade_repo import TradeRepository
 from app.runtime_flags import RUNTIME_FLAG_LIVE_CIRCUIT_BREAKER, RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH
 from app.schemas.live_execution import (
     ExecutionIntentPayload,
@@ -27,6 +29,7 @@ from app.schemas.live_execution import (
     ShadowExecutionResult,
 )
 from app.services.market_client import MarketClientProtocol, build_market_client
+from app.services.proof_of_edge import ProofOfEdgeService
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,10 @@ class LiveKillSwitchEnabledError(LiveExecutionError):
 
 class CircuitBreakerTriggeredError(LiveExecutionError):
     """Raised when circuit breaker blocks live execution."""
+
+
+class LiveEdgeGateBlockedError(LiveExecutionError):
+    """Raised when paper-trading proof of edge is not strong enough for live mode."""
 
 
 class CLOBClientProtocol(Protocol):
@@ -305,6 +312,8 @@ class LiveExecutionService:
         runtime_flag_repository: RuntimeFlagRepository,
         execution_intent_repository: ExecutionIntentRepository,
         live_trade_repository: LiveTradeRepository,
+        trade_repository: TradeRepository,
+        scheduler_cycle_repository: SchedulerCycleRepository,
         market_client: MarketClientProtocol,
         clob_client: CLOBClientProtocol,
     ) -> None:
@@ -314,6 +323,8 @@ class LiveExecutionService:
         self.runtime_flag_repository = runtime_flag_repository
         self.execution_intent_repository = execution_intent_repository
         self.live_trade_repository = live_trade_repository
+        self.trade_repository = trade_repository
+        self.scheduler_cycle_repository = scheduler_cycle_repository
         self.market_client = market_client
         self.clob_client = clob_client
 
@@ -639,6 +650,8 @@ class LiveExecutionService:
         if not self.settings.live_trading_enabled:
             raise LiveTradingDisabledError("LIVE_TRADING_ENABLED=false")
 
+        await self._assert_paper_edge_gate_passed()
+
         kill_switch_enabled = await self.runtime_flag_repository.get_bool(
             key=RUNTIME_FLAG_LIVE_TRADING_KILL_SWITCH,
             default=False,
@@ -681,6 +694,33 @@ class LiveExecutionService:
             raise LiveExecutionError(
                 f"daily_exposure={daily_exposure + approved_size_usd:.2f} exceeds "
                 f"LIVE_MAX_DAILY_EXPOSURE_USD={self.settings.live_max_daily_exposure_usd:.2f}"
+            )
+
+    async def _assert_paper_edge_gate_passed(self) -> None:
+        stats = await self.trade_repository.get_trade_statistics()
+        win_rate = float(stats.get("win_rate", 0.0))
+        min_win_rate = float(self.settings.live_min_paper_win_rate)
+        if win_rate < min_win_rate:
+            raise LiveEdgeGateBlockedError(
+                f"paper_win_rate_below_live_min:{win_rate:.4f}<{min_win_rate:.4f}"
+            )
+
+        if not self.settings.live_require_phase_gate_passed:
+            return
+
+        proof_service = ProofOfEdgeService(
+            trade_repository=self.trade_repository,
+            analysis_repository=self.analysis_repository,
+            scheduler_cycle_repository=self.scheduler_cycle_repository,
+        )
+        report = await proof_service.build_phase_gate_report(
+            settings=self.settings,
+            window_days=self.settings.live_phase_gate_window_days,
+        )
+        if report.verdict != "PASS":
+            raise LiveEdgeGateBlockedError(
+                f"paper_phase_gate_not_passed:{report.verdict};"
+                f"reasons={','.join(report.reasons)}"
             )
 
     async def _assert_live_loss_limit_not_breached(self) -> None:
@@ -760,6 +800,8 @@ async def simulate_execution_intent(
         runtime_flag_repository=RuntimeFlagRepository(session),
         execution_intent_repository=ExecutionIntentRepository(session),
         live_trade_repository=LiveTradeRepository(session),
+        trade_repository=TradeRepository(session),
+        scheduler_cycle_repository=SchedulerCycleRepository(session),
         market_client=build_market_client(settings),
         clob_client=build_clob_client(settings),
     )
@@ -783,6 +825,8 @@ async def place_live_order(
         runtime_flag_repository=RuntimeFlagRepository(session),
         execution_intent_repository=ExecutionIntentRepository(session),
         live_trade_repository=LiveTradeRepository(session),
+        trade_repository=TradeRepository(session),
+        scheduler_cycle_repository=SchedulerCycleRepository(session),
         market_client=build_market_client(settings),
         clob_client=build_clob_client(settings),
     )

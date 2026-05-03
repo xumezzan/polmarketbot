@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Iterable
 
 import sqlalchemy as sa
@@ -27,6 +27,7 @@ from app.services.anomaly_hunter import (
 from app.services.daily_report import run_daily_report
 from app.services.live_execution import (
     CircuitBreakerTriggeredError,
+    LiveEdgeGateBlockedError,
     LiveExecutionError,
     LiveKillSwitchEnabledError,
     LiveTradingDisabledError,
@@ -235,6 +236,23 @@ class PipelineScheduler:
                         f"stale pending news skipped={len(stale_pending_news)}",
                         style="yellow",
                     )
+                    if self.settings.scheduler_delete_stale_pending_news:
+                        freshness_limit = resolve_news_age_limit_minutes(self.settings)
+                        deleted_stale_count = await NewsRepository(session).delete_stale_without_analysis(
+                            cutoff=started_at - timedelta(minutes=freshness_limit)
+                        )
+                        log_event(
+                            logger,
+                            "scheduler_stale_pending_news_deleted",
+                            cycle_id=cycle_id,
+                            deleted_count=deleted_stale_count,
+                            freshness_limit_minutes=freshness_limit,
+                        )
+                        self._dashboard_log(
+                            "CLEAN",
+                            f"stale pending news deleted={deleted_stale_count}",
+                            style="yellow",
+                        )
 
                 item_results: list[PipelineItemResult] = []
                 actionable_signal_count = 0
@@ -412,6 +430,7 @@ class PipelineScheduler:
                                 )
                             except (
                                 LiveTradingDisabledError,
+                                LiveEdgeGateBlockedError,
                                 LiveKillSwitchEnabledError,
                                 CircuitBreakerTriggeredError,
                             ) as exc:
