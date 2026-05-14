@@ -1,8 +1,11 @@
 import logging
 from datetime import datetime, timedelta, timezone
 from html import escape
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Query
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -53,6 +56,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title=settings.app_name)
 
+DASHBOARD_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+DASHBOARD_ASSETS = DASHBOARD_DIST / "assets"
+
+app.mount(
+    "/dashboard/assets",
+    StaticFiles(directory=str(DASHBOARD_ASSETS), check_dir=False),
+    name="dashboard-assets",
+)
+
 
 def _build_operator_service(session: AsyncSession) -> OperatorService:
     return OperatorService(
@@ -89,6 +101,27 @@ async def app_startup() -> None:
 async def health_check() -> dict[str, str]:
     """Simple liveness check for Docker and external monitoring."""
     return {"status": "ok"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse, response_model=None)
+@app.get("/dashboard/", response_class=HTMLResponse, response_model=None)
+async def dashboard():
+    """Serve the compiled React operator dashboard when frontend assets exist."""
+    index_file = DASHBOARD_DIST / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+
+    return HTMLResponse(
+        status_code=503,
+        content=(
+            "<!doctype html><title>Dashboard not built</title>"
+            "<body style='font-family: sans-serif; padding: 2rem;'>"
+            "<h1>Dashboard is not built</h1>"
+            "<p>Run <code>cd frontend && npm install && npm run build</code>, "
+            "or use <code>npm run dev</code> for Vite development.</p>"
+            "</body>"
+        ),
+    )
 
 
 @app.get("/admin/status", response_model=AdminStatusResponse)

@@ -22,6 +22,31 @@ docker compose up --build
 - это значит: demo-новости, demo-LLM, demo-markets и без реальных Telegram alerts
 - для реальных API позже достаточно задать нужные переменные в `.env`
 
+## Web Dashboard
+
+React dashboard лежит в `frontend/` и подключен к существующим FastAPI operator endpoints.
+
+Production build:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+После этого dashboard доступен из API:
+
+```text
+http://localhost:8000/dashboard
+```
+
+Для разработки можно запустить Vite отдельно. Запросы `/admin/*` будут проксироваться в FastAPI на `localhost:8000`:
+
+```bash
+cd frontend
+npm run dev
+```
+
 ## Реальный Paper Mode
 
 Для paper trading с реальными новостями, реальным OpenAI и реальным Gamma API уже готов шаблон [paper_real.env](/Users/whomaun/polmarketbot/paper_real.env).
