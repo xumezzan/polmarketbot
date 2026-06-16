@@ -115,6 +115,8 @@ class NewsNormalizer:
         "whale",
     }
     BLOCKED_KEYWORDS = {
+        "analyst predicts",
+        "analyst says",
         "auction",
         "bring a trailer",
         "blue jackets",
@@ -132,6 +134,11 @@ class NewsNormalizer:
         "vacation",
         "restaurant",
         "honorary degree",
+        "price analysis",
+        "price prediction",
+        "resistance level",
+        "support level",
+        "technical analysis",
     }
 
     def __init__(self, *, settings: Settings) -> None:

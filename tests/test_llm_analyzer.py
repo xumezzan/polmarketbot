@@ -111,10 +111,11 @@ def test_openai_prompt_discourages_vague_crypto_queries() -> None:
     prompt = client._build_user_prompt(news_item)
 
     assert "confirmed, direct catalyst" in prompt
-    assert "next 3 hours" in prompt
+    assert "resolvable event catalysts" in prompt
     assert "directly and obviously" in prompt
     assert "causality_score" in prompt
     assert "Do not infer a trade only from general sentiment" in prompt
+    assert "Do not trade a Bitcoin or crypto price target market from bullish or bearish commentary alone" in prompt
 
 
 def test_market_readiness_scores_concrete_directional_queries() -> None:
